@@ -1,0 +1,45 @@
+optimizer.cpp
+// File: src/optimizer.cpp
+#include "optimizer.hpp"
+
+bool converged(const std::vector<Gradient>& grads, double thresh) {
+    for (auto& g : grads) {
+        double norm = std::sqrt(g.fx * g.fx + g.fy * g.fy + g.fz * g.fz);
+        if (norm > thresh)
+            return false;
+    }
+    return true;
+}
+
+void update_coords(std::vector<Atom>& atoms, const std::vector<Gradient>& grads, double alpha) {
+    for (size_t i = 0; i < atoms.size(); ++i) {
+        atoms[i].x -= alpha * grads[i].fx;
+        atoms[i].y -= alpha * grads[i].fy;
+        atoms[i].z -= alpha * grads[i].fz;
+    }
+}
+optimizer.hpp
+// File: src/optimizer.h
+#ifndef OPTIMIZER_H
+#define OPTIMIZER_H
+
+#include <vector>
+#include <string>
+#include <cmath>
+
+struct Atom {
+    std::string symbol;
+    double x, y, z;
+};
+
+struct Gradient {
+    double fx, fy, fz;
+};
+
+// 判断是否收敛：每个原子的梯度模均小于阈值
+bool converged(const std::vector<Gradient>& grads, double thresh = 1e-4);
+
+// 用最速下降法更新坐标：新坐标 = 旧坐标 - alpha * 梯度
+void update_coords(std::vector<Atom>& atoms, const std::vector<Gradient>& grads, double alpha);
+
+#endif // OPTIMIZER_H
