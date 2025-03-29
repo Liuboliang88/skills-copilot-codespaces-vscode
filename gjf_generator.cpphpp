@@ -1,0 +1,50 @@
+gjf_generator.cpp
+// File: src/gjf_generator.cpp
+#include "gjf_generator.hpp"
+#include <fstream>
+#include <cstdio>
+
+std::string atom_to_string(const Atom& atm) {
+    char buff[128];
+    std::sprintf(buff, "%-2s  %16.10lf %16.10lf %16.10lf",
+                               atm.symbol.data(), atm.x, atm.y, atm.z);
+    return std::string(buff);
+}
+
+void writeGJF(const std::string& filename, const std::vector<Atom>& atoms, int iteration) {
+    std::ofstream fout(filename);
+    // 指定检查点文件，便于Gaussian后续使用（这里用迭代步数命名）
+    fout << "%chk=opt_step" << iteration << ".chk\n";
+    // 使用 force 关键词计算梯度，不进行自动优化
+    fout << "# rhf/sto-3g force\n\n";
+    fout << "Optimization Step " << iteration << "\n\n";
+    // 电荷与多重度：假设中性分子和单重态
+    fout << "0 1\n";
+    // 写入原子坐标
+    for (const auto& atom : atoms) {
+        fout << " " << atom_to_string(atom) << "\n";
+    }
+    fout << "\n";
+
+    // // 对于水分子，硬编码连接关系
+    // if (atoms.size() == 3) {
+    //     fout << "1 2 1.0 3 1.0\n2\n3\n";
+    // }
+    
+    // 其他分子可扩展连接信息
+    fout.close();
+}
+
+// File: src/gjf_generator.h
+#ifndef GJF_GENERATOR_H
+#define GJF_GENERATOR_H
+
+#include <vector>
+#include <string>
+#include "optimizer.hpp"  // Atom struct
+
+// 根据原子坐标生成 Gaussian 输入文件 (.gjf)
+// 参数 iteration 用于命名文件
+void writeGJF(const std::string& filename, const std::vector<Atom>& atoms, int iteration);
+
+#endif // GJF_GENERATOR_H
