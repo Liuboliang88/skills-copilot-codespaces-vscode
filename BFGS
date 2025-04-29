@@ -1,4 +1,4 @@
-gaussian_parser.cpp
+·gaussian_parser.cpp
 
 #include "gaussian_parser.hpp"
 #include <fstream>
@@ -68,7 +68,7 @@ std::vector<Gradient> parse_gradient(const std::string& filename) {
     return gradients;
 }
 
-// ✅ gaussian_parser.hpp
+·// ✅ gaussian_parser.hpp
 #pragma once
 #include <vector>
 #include <string>
@@ -77,7 +77,7 @@ std::vector<Gradient> parse_gradient(const std::string& filename) {
 std::vector<Gradient> parse_gradient(const std::string& filename);
 double parse_energy(const std::string& filename);
 
-gjf_generator.cpp
+·gjf_generator.cpp
 // File: src/gjf_generator.cpp
 #include "gjf_generator.hpp"
 #include <fstream>
@@ -110,7 +110,7 @@ void writeGJF(const std::string& filename, const std::vector<Atom>& atoms, int i
     fout.close();
 }
 
-gjf_generator.hpp
+·gjf_generator.hpp
 // File: src/gjf_generator.hpp
 #ifndef GJF_GENERATOR_HPP
 #define GJF_GENERATOR_HPP
@@ -129,7 +129,7 @@ void writeGJF(const std::string& filename, const std::vector<Atom>& atoms, int i
 
 #endif // GJF_GENERATOR_HPP
 
-matrix1.cpp
+·matrix1.cpp
 #include "matrix1.hpp"
 #include <cmath>
 #include <stdexcept>
@@ -433,7 +433,7 @@ Matrix operator%(const Matrix &m1, const Matrix &m2) {
     return result;
 }
 
-matrix.hpp
+·matrix.hpp
 #pragma once
 #include <vector>
 #include <stdexcept>
@@ -499,7 +499,8 @@ public:
 
     friend Matrix operator%(const Matrix& m1, const Matrix& m2);
 };
-optimizer.cpp
+
+·optimizer.cpp
 #include "optimizer.hpp"
 #include "matrix1.hpp"
 #include <cmath>
@@ -535,7 +536,7 @@ void bfgs_update(Matrix& H, const Matrix& s, const Matrix& y) {
     H = H_new;
 }
 
-optimizer.hpp
+·optimizer.hpp
 #pragma once
 
 #include <vector>
