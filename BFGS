@@ -1,0 +1,557 @@
+gaussian_parser.cpp
+
+#include "gaussian_parser.hpp"
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <regex>
+#include <vector>
+#include <string>
+
+// 提取 SCF Done 能量
+double parse_energy(const std::string& filename) {
+    std::ifstream fin(filename);
+    if (!fin) {
+        std::cerr << "Failed to open file: " << filename << "\n";
+        return 1e10;
+    }
+
+    std::string line;
+    std::regex energy_pattern("SCF Done:.*?=\\s*(-?\\d+\\.\\d+)");
+    std::smatch match;
+
+    while (std::getline(fin, line)) {
+        if (std::regex_search(line, match, energy_pattern)) {
+            return std::stod(match[1]);
+        }
+    }
+
+    std::cerr << "[parser] ❌ Failed to find energy in " << filename << "\n";
+    return 1e10;
+}
+
+
+std::vector<Gradient> parse_gradient(const std::string& filename) {
+    std::ifstream fin(filename);
+    if (!fin) {
+        std::cerr << "Failed to open file: " << filename << "\n";
+        return {};
+    }
+
+    std::string line;
+    std::vector<Gradient> gradients;
+    bool in_grad = false;
+
+    while (std::getline(fin, line)) {
+        if (line.find("Forces (Hartrees/Bohr)") != std::string::npos) {
+            std::getline(fin, line); // skip header
+            std::getline(fin, line); // skip ----
+            in_grad = true;
+            continue;
+        }
+        if (in_grad) {
+            if (line.empty() || line.find("-----") != std::string::npos)
+                break;
+
+            std::istringstream iss(line);
+            int index, Z;
+            double fx, fy, fz;
+            if (!(iss >> index >> Z >> fx >> fy >> fz)) break;
+
+            gradients.push_back({fx, fy, fz});
+        }
+    }
+
+    if (gradients.empty())
+        std::cerr << "[parser] ❌ Failed to find gradient data in " << filename << "\n";
+
+    return gradients;
+}
+
+// ✅ gaussian_parser.hpp
+#pragma once
+#include <vector>
+#include <string>
+#include "optimizer.hpp"
+
+std::vector<Gradient> parse_gradient(const std::string& filename);
+double parse_energy(const std::string& filename);
+
+gjf_generator.cpp
+// File: src/gjf_generator.cpp
+#include "gjf_generator.hpp"
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+
+void writeGJF(const std::string& filename, const std::vector<Atom>& atoms, int iteration, bool use_scf_qc) {
+    std::ofstream fout(filename);
+    if (!fout) {
+        std::cerr << "Error opening file: " << filename << std::endl;
+        return;
+    }
+    // 指定检查点文件
+    fout << "%chk=opt_step" << iteration << ".chk\n";
+    // Gaussian 路由行：不再使用 geom=connectivity，直接以笛卡尔坐标进行优化
+    fout << "# rhf/sto-3g force";
+    if (use_scf_qc) fout << " scf=qc";
+    fout << "\n\n";
+    fout << "Optimization Step " << iteration << "\n\n";
+    // 假设分子整体电荷为 0，多重度为 1
+    fout << "0 1\n";
+    
+    // 写入原子坐标（笛卡尔坐标），例如：\n// C  0.0000   0.0000   0.0000\n// H  0.6300   0.6300   0.6300\n    \n
+    fout << std::fixed << std::setprecision(6);
+    for (const auto& atom : atoms) {
+        fout << atom.symbol << "    " << atom.x << "    " << atom.y << "    " << atom.z << "\n";
+    }
+    fout << "\n";
+    // 不再输出连接信息，Gaussian 将直接以笛卡尔坐标处理
+    fout.close();
+}
+
+gjf_generator.hpp
+// File: src/gjf_generator.hpp
+#ifndef GJF_GENERATOR_HPP
+#define GJF_GENERATOR_HPP
+
+#include <string>
+#include <vector>
+#include "optimizer.hpp"
+
+// 写入 Gaussian 输入文件，使用笛卡尔坐标（不包含 geom=connectivity）
+// 参数：
+//   filename     - 输入文件名称
+//   atoms        - 原子坐标（笛卡尔）
+//   iteration    - 当前迭代步数，用于检查点文件命名
+//   use_scf_qc   - 是否在路由行中加入 scf=qc 选项（用于增强 SCF 收敛）
+void writeGJF(const std::string& filename, const std::vector<Atom>& atoms, int iteration, bool use_scf_qc);
+
+#endif // GJF_GENERATOR_HPP
+
+matrix1.cpp
+#include "matrix1.hpp"
+#include <cmath>
+#include <stdexcept>
+#include <eigen3/Eigen/Dense>
+
+// 添加了以下两个成员变量：
+//     std::size_t nRow;
+//     std::size_t nCol;
+
+// 构造函数
+Matrix::Matrix() : nRow(0), nCol(0), data() {}
+
+Matrix::Matrix(std::size_t nRow, std::size_t nCol, const double val)
+    : nRow(nRow), nCol(nCol), data(nRow * nCol, val) {}
+
+Matrix::Matrix(std::size_t nRow, std::size_t nCol, const std::vector<double> &data)
+    : nRow(nRow), nCol(nCol), data(data)
+{
+    if (data.size() != nRow * nCol)
+        throw std::invalid_argument("Data size does not match matrix dimensions.");
+}
+
+// 获取行数、列数和元素总数
+std::size_t Matrix::rows() const { return nRow; }
+std::size_t Matrix::cols() const { return nCol; }
+std::size_t Matrix::size() const { return data.size(); }
+
+// 重载 () 运算符（不做边界检查）
+double Matrix::operator()(std::size_t i, std::size_t j) const {
+    return data[i * nCol + j];
+}
+
+double& Matrix::operator()(std::size_t i, std::size_t j) {
+    return data[i * nCol + j];
+}
+
+double Matrix::operator()(std::size_t i) const {
+    return data[i];
+}
+
+double& Matrix::operator()(std::size_t i) {
+    return data[i];
+}
+
+// at() 方法（增加行、列范围检查）
+double Matrix::at(std::size_t i, std::size_t j) const {
+    if (i >= nRow || j >= nCol)
+        throw std::out_of_range("Index (i,j) out of range.");
+    return data.at(i * nCol + j);
+}
+
+double& Matrix::at(std::size_t i, std::size_t j) {
+    if (i >= nRow || j >= nCol)
+        throw std::out_of_range("Index (i,j) out of range.");
+    return data.at(i * nCol + j);
+}
+
+double Matrix::at(std::size_t i) const {
+    if (i >= data.size())
+        throw std::out_of_range("Index i out of range.");
+    return data.at(i);
+}
+
+double& Matrix::at(std::size_t i) {
+    if (i >= data.size())
+        throw std::out_of_range("Index i out of range.");
+    return data.at(i);
+}
+
+// Frobenius 范数
+double Matrix::norm() const {
+    double sum = 0.0;
+    for (auto &val : data)
+        sum += val * val;
+    return std::sqrt(sum);
+}
+
+// 转置矩阵
+Matrix Matrix::trans() const {
+    Matrix result(nCol, nRow);
+    for (std::size_t i = 0; i < nRow; ++i)
+        for (std::size_t j = 0; j < nCol; ++j)
+            result(j, i) = (*this)(i, j);
+    return result;
+}
+
+// 使用 Eigen3 库求逆（仅适用于方阵）
+Matrix Matrix::inver() const {
+    if (nRow != nCol)
+        throw std::invalid_argument("Matrix must be square to invert.");
+
+    // 将当前 Matrix 转换为 Eigen::MatrixXd
+    Eigen::MatrixXd A_eigen(nRow, nCol);
+    for (std::size_t i = 0; i < nRow; ++i) {
+        for (std::size_t j = 0; j < nCol; ++j) {
+            A_eigen(i, j) = (*this)(i, j);
+        }
+    }
+
+    // 使用 Eigen 求逆
+    // 如果矩阵不可逆，返回的结果可能不符合预期，这里假设传入矩阵是可逆的
+    Eigen::MatrixXd inv_eigen = A_eigen.inverse();
+
+    // 将结果转换回 Matrix 类型
+    Matrix inv(nRow, nCol);
+    for (std::size_t i = 0; i < nRow; ++i) {
+        for (std::size_t j = 0; j < nCol; ++j) {
+            inv(i, j) = inv_eigen(i, j);
+        }
+    }
+    return inv;
+}
+
+// 解线性方程组 Ax = b，要求 A 为方阵且 b 的行数与 A 相同
+Matrix Matrix::solve(const Matrix &b) const {
+    if (nRow != nCol)
+        throw std::invalid_argument("Matrix must be square to solve linear system.");
+    if (b.rows() != nRow)
+        throw std::invalid_argument("Dimension mismatch between matrix and right-hand side.");
+    Matrix invA = this->inver();
+    // 使用矩阵乘积运算符 % 计算 A^-1 * b
+    return invA % b;
+}
+
+// --- 成员运算符重载（标量操作） ---
+
+Matrix& Matrix::operator+=(const double val) {
+    for (auto &d : data)
+        d += val;
+    return *this;
+}
+
+Matrix& Matrix::operator-=(const double val) {
+    for (auto &d : data)
+        d -= val;
+    return *this;
+}
+
+Matrix& Matrix::operator*=(const double val) {
+    for (auto &d : data)
+        d *= val;
+    return *this;
+}
+
+Matrix& Matrix::operator/=(const double val) {
+    if (std::abs(val) < 1e-12)
+        throw std::runtime_error("Division by zero in scalar division.");
+    for (auto &d : data)
+        d /= val;
+    return *this;
+}
+
+// --- 成员运算符重载（逐元素矩阵操作） ---
+
+Matrix& Matrix::operator+=(const Matrix &mat) {
+    if (nRow != mat.nRow || nCol != mat.nCol)
+        throw std::invalid_argument("Matrix dimensions must match for addition.");
+    for (std::size_t i = 0; i < data.size(); ++i)
+        data[i] += mat.data[i];
+    return *this;
+}
+
+Matrix& Matrix::operator-=(const Matrix &mat) {
+    if (nRow != mat.nRow || nCol != mat.nCol)
+        throw std::invalid_argument("Matrix dimensions must match for subtraction.");
+    for (std::size_t i = 0; i < data.size(); ++i)
+        data[i] -= mat.data[i];
+    return *this;
+}
+
+Matrix& Matrix::operator*=(const Matrix &mat) {
+    if (nRow != mat.nRow || nCol != mat.nCol)
+        throw std::invalid_argument("Matrix dimensions must match for element-wise multiplication.");
+    for (std::size_t i = 0; i < data.size(); ++i)
+        data[i] *= mat.data[i];
+    return *this;
+}
+
+Matrix& Matrix::operator/=(const Matrix &mat) {
+    if (nRow != mat.nRow || nCol != mat.nCol)
+        throw std::invalid_argument("Matrix dimensions must match for element-wise division.");
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        if (std::abs(mat.data[i]) < 1e-12)
+            throw std::runtime_error("Division by zero in element-wise division.");
+        data[i] /= mat.data[i];
+    }
+    return *this;
+}
+
+// --- 非成员友元运算符实现 ---
+
+// 一元正号
+Matrix operator+(const Matrix &mat) {
+    return mat;
+}
+
+// 一元负号
+Matrix operator-(const Matrix &mat) {
+    Matrix result(mat.rows(), mat.cols());
+    for (std::size_t i = 0; i < mat.size(); ++i)
+        result(i) = -mat(i);
+    return result;
+}
+
+// 标量与矩阵的二元运算
+Matrix operator+(const Matrix &mat, const double val) {
+    Matrix result(mat);
+    result += val;
+    return result;
+}
+
+Matrix operator-(const Matrix &mat, const double val) {
+    Matrix result(mat);
+    result -= val;
+    return result;
+}
+
+Matrix operator*(const Matrix &mat, const double val) {
+    Matrix result(mat);
+    result *= val;
+    return result;
+}
+
+Matrix operator/(const Matrix &mat, const double val) {
+    Matrix result(mat);
+    result /= val;
+    return result;
+}
+
+Matrix operator+(const double val, const Matrix &mat) {
+    return mat + val;
+}
+
+Matrix operator-(const double val, const Matrix &mat) {
+    Matrix result(mat.rows(), mat.cols());
+    for (std::size_t i = 0; i < mat.size(); ++i)
+        result(i) = val - mat(i);
+    return result;
+}
+
+Matrix operator*(const double val, const Matrix &mat) {
+    return mat * val;
+}
+
+Matrix operator/(const double val, const Matrix &mat) {
+    Matrix result(mat.rows(), mat.cols());
+    for (std::size_t i = 0; i < mat.size(); ++i) {
+        if (std::abs(mat(i)) < 1e-12)
+            throw std::runtime_error("Division by zero in scalar/matrix division.");
+        result(i) = val / mat(i);
+    }
+    return result;
+}
+
+// 逐元素矩阵运算
+Matrix operator+(const Matrix &m1, const Matrix &m2) {
+    if (m1.rows() != m2.rows() || m1.cols() != m2.cols())
+        throw std::invalid_argument("Matrix dimensions must match for addition.");
+    Matrix result(m1);
+    result += m2;
+    return result;
+}
+
+Matrix operator-(const Matrix &m1, const Matrix &m2) {
+    if (m1.rows() != m2.rows() || m1.cols() != m2.cols())
+        throw std::invalid_argument("Matrix dimensions must match for subtraction.");
+    Matrix result(m1);
+    result -= m2;
+    return result;
+}
+
+Matrix operator*(const Matrix &m1, const Matrix &m2) {
+    if (m1.rows() != m2.rows() || m1.cols() != m2.cols())
+        throw std::invalid_argument("Matrix dimensions must match for element-wise multiplication.");
+    Matrix result(m1);
+    result *= m2;
+    return result;
+}
+
+Matrix operator/(const Matrix &m1, const Matrix &m2) {
+    if (m1.rows() != m2.rows() || m1.cols() != m2.cols())
+        throw std::invalid_argument("Matrix dimensions must match for element-wise division.");
+    Matrix result(m1);
+    result /= m2;
+    return result;
+}
+
+// 矩阵乘积（要求 m1.cols() == m2.rows()）
+Matrix operator%(const Matrix &m1, const Matrix &m2) {
+    if (m1.cols() != m2.rows())
+        throw std::invalid_argument("Matrix dimensions do not match for multiplication.");
+    Matrix result(m1.rows(), m2.cols(), 0.0);
+    for (std::size_t i = 0; i < m1.rows(); ++i) {
+        for (std::size_t j = 0; j < m2.cols(); ++j) {
+            double sum = 0.0;
+            for (std::size_t k = 0; k < m1.cols(); ++k)
+                sum += m1(i, k) * m2(k, j);
+            result(i, j) = sum;
+        }
+    }
+    return result;
+}
+
+matrix.hpp
+#pragma once
+#include <vector>
+#include <stdexcept>
+#include <cmath>
+
+class Matrix {
+private:
+    std::size_t nRow, nCol;
+    std::vector<double> data;
+
+public:
+    Matrix();
+    Matrix(std::size_t nRow, std::size_t nCol, const double val = 0.0);
+    Matrix(std::size_t nRow, std::size_t nCol, const std::vector<double>& data);
+    Matrix(std::size_t nRow, std::size_t nCol, const Matrix& mat); // 展平构造
+
+    std::size_t rows() const;
+    std::size_t cols() const;
+    std::size_t size() const;
+
+    double operator()(std::size_t i, std::size_t j) const;
+    double& operator()(std::size_t i, std::size_t j);
+    double operator()(std::size_t i) const;
+    double& operator()(std::size_t i);
+
+    double at(std::size_t i, std::size_t j) const;
+    double& at(std::size_t i, std::size_t j);
+    double at(std::size_t i) const;
+    double& at(std::size_t i);
+
+    double norm() const;
+    Matrix trans() const;
+    Matrix inver() const;
+    Matrix solve(const Matrix& b) const;
+
+    Matrix& operator+=(const double val);
+    Matrix& operator-=(const double val);
+    Matrix& operator*=(const double val);
+    Matrix& operator/=(const double val);
+
+    Matrix& operator+=(const Matrix& mat);
+    Matrix& operator-=(const Matrix& mat);
+    Matrix& operator*=(const Matrix& mat);
+    Matrix& operator/=(const Matrix& mat);
+
+    friend Matrix operator+(const Matrix& mat);
+    friend Matrix operator-(const Matrix& mat);
+
+    friend Matrix operator+(const Matrix& mat, const double val);
+    friend Matrix operator-(const Matrix& mat, const double val);
+    friend Matrix operator*(const Matrix& mat, const double val);
+    friend Matrix operator/(const Matrix& mat, const double val);
+
+    friend Matrix operator+(const double val, const Matrix& mat);
+    friend Matrix operator-(const double val, const Matrix& mat);
+    friend Matrix operator*(const double val, const Matrix& mat);
+    friend Matrix operator/(const double val, const Matrix& mat);
+
+    friend Matrix operator+(const Matrix& m1, const Matrix& m2);
+    friend Matrix operator-(const Matrix& m1, const Matrix& m2);
+    friend Matrix operator*(const Matrix& m1, const Matrix& m2);
+    friend Matrix operator/(const Matrix& m1, const Matrix& m2);
+
+    friend Matrix operator%(const Matrix& m1, const Matrix& m2);
+};
+optimizer.cpp
+#include "optimizer.hpp"
+#include "matrix1.hpp"
+#include <cmath>
+#include <vector>
+
+// 判断收敛：所有原子梯度范数均小于阈值
+bool converged(const std::vector<Gradient>& grads, double threshold) {
+    for (const auto& g : grads) {
+        double norm = std::sqrt(g.fx * g.fx + g.fy * g.fy + g.fz * g.fz);
+        if (norm > threshold)
+            return false;
+    }
+    return true;
+}
+
+// 使用 Matrix 类型进行 BFGS 更新实现
+void bfgs_update(Matrix& H, const Matrix& s, const Matrix& y) {
+    double sTy = 0.0;
+    for (std::size_t i = 0; i < s.size(); ++i)
+        sTy += s(i) * y(i);
+
+    if (std::abs(sTy) < 1e-10) return;
+
+    double rho = 1.0 / sTy;
+    Matrix I(H.rows(), H.cols(), 0.0);
+    for (std::size_t i = 0; i < H.rows(); ++i)
+        I(i, i) = 1.0;
+
+    Matrix A = I - rho * (s % y.trans());
+    Matrix B = I - rho * (y % s.trans());
+    Matrix H_new = A % H % B + rho * (s % s.trans());
+
+    H = H_new;
+}
+
+optimizer.hpp
+#pragma once
+
+#include <vector>
+#include "matrix1.hpp"
+
+struct Atom {
+    std::string symbol;
+    double x, y, z;
+};
+
+struct Gradient {
+    double fx, fy, fz;
+};
+
+// 判断是否收敛
+bool converged(const std::vector<Gradient>& grads, double threshold);
+
+// 使用 Matrix 类型进行 BFGS 更新
+void bfgs_update(Matrix& H, const Matrix& s, const Matrix& y);
