@@ -1,0 +1,1045 @@
+main2.cpp
+
+#include "molecule.hpp"
+#include "utility.hpp"
+#include "gdiis.hpp"
+#include <iostream>
+#include <cstdlib>
+#include <algorithm>
+
+bool converged(const std::vector<Vec3f64>& grads, double thresh) {
+    for (const Vec3f64& g : grads) {
+        double norm = g.len();
+        if (norm > thresh) return false;
+    }
+    return true;
+}
+
+double max_gradient(const std::vector<Vec3f64>& grads) {
+    double maxGrad = 0;
+
+    for (const Vec3f64& g : grads) {
+        double norm = g.len();
+        maxGrad = std::max(norm, maxGrad);
+    }
+
+    return maxGrad;
+}
+
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        std::cerr << "usage: opt mol.txt" << std::endl;
+        std::abort();
+    }
+
+    Molecule mol(argv[1]);
+    std::size_t nAtom = mol.coords.size();
+
+    int max_iter = 100;
+    double threshold = 1e-4;
+    bool is_converged = false;
+
+    GDIIS gdiis;
+    std::vector<Vec3f64> grads;
+    std::vector<std::vector<Vec3f64>> grad_hist;
+
+    for (std::size_t iter = 1; iter <= max_iter; ++iter) {
+        grads = mol.calculate_gradient();
+
+        double maxGrad = max_gradient(grads);
+        std::printf("iter = %ld, max grad = %.6lf\n", iter, maxGrad);
+
+        if (converged(grads, threshold)) {
+            is_converged = true;
+            break;
+        }
+
+        std::vector<Vec3f64> error_vec(nAtom);
+        if (iter == 1) {
+            error_vec = grads;
+        } else {
+            const auto& prev = grad_hist.back();
+            for (std::size_t i = 0; i < nAtom; ++i) {
+                error_vec[i] = grads[i] - prev[i];
+            }
+        }
+        grad_hist.push_back(grads);
+
+        Matrix errMat = vec3f64Vector_to_matrix(error_vec)
+                            .reshape(3 * nAtom, 1);
+        Matrix xMat   = vec3f64Vector_to_matrix(mol.coords)
+                            .reshape(3 * nAtom, 1);
+
+        Matrix xNew = gdiis.update(xMat, errMat);
+
+        auto new_coords = matrix_to_vec3f64Vector(
+                               xNew.reshape(nAtom, 3)
+                           );
+        mol.coords = new_coords;
+    }
+
+    if (is_converged) {
+        std::cout << "converged." << std::endl;
+    } else {
+        std::cout << "not converged" << std::endl;
+    }
+
+    std::cout << "Final structure: " << std::endl;
+    std::cout << mol.to_geometry() << std::endl;
+
+    std::cout << "Final forces (Hartrees/Bohr): " << std::endl;
+    for (std::size_t i = 0; i < grads.size(); ++i) {
+        std::cout << grads[i].to_string() << std::endl;
+    }
+
+    return 0;
+}
+
+`gdiis.cpp
+#include "gdiis.hpp"
+#include <cassert>
+
+GDIIS::GDIIS(std::size_t minSpace, std::size_t maxSpace)
+: minSpace(minSpace), maxSpace(maxSpace) {}
+
+Matrix GDIIS::update(const Matrix& x, const Matrix& r) {
+    const double rate = 0.2;
+    
+    xVec.push_back(x);
+    rVec.push_back(r);
+
+    if (xVec.size() < minSpace) {
+        return x - rate * r;
+    }
+
+    if (xVec.size() > maxSpace) {
+        xVec.erase(xVec.begin());
+        rVec.erase(rVec.begin());
+    }
+
+    Matrix B(xVec.size() + 1, xVec.size() + 1, 0.0);
+    for (std::size_t i = 0; i < xVec.size(); ++i) {
+        B(i, xVec.size()) = B(xVec.size(), i) = -1.0;
+    }
+
+    for (std::size_t i = 0; i < rVec.size(); ++i) {
+    for (std::size_t j = 0; j < rVec.size(); ++j) {
+        Matrix r = rVec[i].trans() % rVec[j];
+
+        assert(r.size() == 1);
+        B(i, j) = r(0, 0);
+    }}
+
+    Matrix b(xVec.size() + 1, 1, 0.0);
+    b(xVec.size(), 0) = -1.0;
+    Matrix c = B.solve(b);
+    Matrix xNew(x.size(), 1, 0.0);
+    for (std::size_t i = 0; i < xVec.size(); ++i) {
+        xNew += xVec[i] * c(i, 0);
+    }
+    
+    return xNew;
+}
+
+`gdiis.hpp
+#pragma once
+
+#include "matrix.hpp"
+#include <vector>
+
+// in GDIIS, all Matrix are of shape (3n x 1)
+// where n is the number of atom
+
+class GDIIS {
+public:
+    std::size_t minSpace;
+    std::size_t maxSpace;
+
+    std::vector<Matrix> xVec;
+    std::vector<Matrix> rVec;
+
+    GDIIS(std::size_t minSpace = 5, std::size_t maxSpace = 10);
+
+    Matrix update(const Matrix& x, const Matrix& r);
+};
+
+`matrix.cpp
+#include "matrix.hpp"
+#include <cmath>
+#include <stdexcept>
+#include <eigen3/Eigen/Dense>
+
+// 添加了以下两个成员变量：
+//     std::size_t nRow;
+//     std::size_t nCol;
+
+// 构造函数
+Matrix::Matrix() : nRow(0), nCol(0), data() {}
+
+Matrix::Matrix(std::size_t nRow, std::size_t nCol, const double val)
+    : nRow(nRow), nCol(nCol), data(nRow * nCol, val) {}
+
+Matrix::Matrix(std::size_t nRow, std::size_t nCol, const std::vector<double> &data)
+    : nRow(nRow), nCol(nCol), data(data)
+{
+    if (data.size() != nRow * nCol)
+        throw std::invalid_argument("Data size does not match matrix dimensions.");
+}
+
+// 获取行数、列数和元素总数
+std::size_t Matrix::rows() const { return nRow; }
+std::size_t Matrix::cols() const { return nCol; }
+std::size_t Matrix::size() const { return data.size(); }
+
+// 重载 () 运算符（不做边界检查）
+double Matrix::operator()(std::size_t i, std::size_t j) const {
+    return data[i * nCol + j];
+}
+
+double& Matrix::operator()(std::size_t i, std::size_t j) {
+    return data[i * nCol + j];
+}
+
+double Matrix::operator()(std::size_t i) const {
+    return data[i];
+}
+
+double& Matrix::operator()(std::size_t i) {
+    return data[i];
+}
+
+// at() 方法（增加行、列范围检查）
+double Matrix::at(std::size_t i, std::size_t j) const {
+    if (i >= nRow || j >= nCol)
+        throw std::out_of_range("Index (i,j) out of range.");
+    return data.at(i * nCol + j);
+}
+
+double& Matrix::at(std::size_t i, std::size_t j) {
+    if (i >= nRow || j >= nCol)
+        throw std::out_of_range("Index (i,j) out of range.");
+    return data.at(i * nCol + j);
+}
+
+double Matrix::at(std::size_t i) const {
+    if (i >= data.size())
+        throw std::out_of_range("Index i out of range.");
+    return data.at(i);
+}
+
+double& Matrix::at(std::size_t i) {
+    if (i >= data.size())
+        throw std::out_of_range("Index i out of range.");
+    return data.at(i);
+}
+
+// Frobenius 范数
+double Matrix::norm() const {
+    double sum = 0.0;
+    for (auto &val : data)
+        sum += val * val;
+    return std::sqrt(sum);
+}
+
+// 转置矩阵
+Matrix Matrix::trans() const {
+    Matrix result(nCol, nRow);
+    for (std::size_t i = 0; i < nRow; ++i)
+        for (std::size_t j = 0; j < nCol; ++j)
+            result(j, i) = (*this)(i, j);
+    return result;
+}
+
+// 使用 Eigen3 库求逆（仅适用于方阵）
+Matrix Matrix::inver() const {
+    if (nRow != nCol)
+        throw std::invalid_argument("Matrix must be square to invert.");
+
+    // 将当前 Matrix 转换为 Eigen::MatrixXd
+    Eigen::MatrixXd A_eigen(nRow, nCol);
+    for (std::size_t i = 0; i < nRow; ++i) {
+        for (std::size_t j = 0; j < nCol; ++j) {
+            A_eigen(i, j) = (*this)(i, j);
+        }
+    }
+
+    // 使用 Eigen 求逆
+    // 如果矩阵不可逆，返回的结果可能不符合预期，这里假设传入矩阵是可逆的
+    Eigen::MatrixXd inv_eigen = A_eigen.inverse();
+
+    // 将结果转换回 Matrix 类型
+    Matrix inv(nRow, nCol);
+    for (std::size_t i = 0; i < nRow; ++i) {
+        for (std::size_t j = 0; j < nCol; ++j) {
+            inv(i, j) = inv_eigen(i, j);
+        }
+    }
+    return inv;
+}
+
+// 解线性方程组 Ax = b，要求 A 为方阵且 b 的行数与 A 相同
+Matrix Matrix::solve(const Matrix &b) const {
+    if (nRow != nCol)
+        throw std::invalid_argument("Matrix must be square to solve linear system.");
+    if (b.rows() != nRow)
+        throw std::invalid_argument("Dimension mismatch between matrix and right-hand side.");
+    Matrix invA = this->inver();
+    // 使用矩阵乘积运算符 % 计算 A^-1 * b
+    return invA % b;
+}
+
+
+Matrix Matrix::reshape(std::size_t r, std::size_t c) const {
+    if (nRow * nCol != r * c) {
+        throw std::invalid_argument("Dimension of reshape not match.");
+    }
+
+    Matrix mat(r, c);
+    for (std::size_t i = 0; i < size(); ++i) {
+        mat(i) = (*this)(i);
+    }
+
+    return mat;
+}
+
+
+// --- 成员运算符重载（标量操作） ---
+
+Matrix& Matrix::operator+=(const double val) {
+    for (auto &d : data)
+        d += val;
+    return *this;
+}
+
+Matrix& Matrix::operator-=(const double val) {
+    for (auto &d : data)
+        d -= val;
+    return *this;
+}
+
+Matrix& Matrix::operator*=(const double val) {
+    for (auto &d : data)
+        d *= val;
+    return *this;
+}
+
+Matrix& Matrix::operator/=(const double val) {
+    if (std::abs(val) < 1e-12)
+        throw std::runtime_error("Division by zero in scalar division.");
+    for (auto &d : data)
+        d /= val;
+    return *this;
+}
+
+// --- 成员运算符重载（逐元素矩阵操作） ---
+
+Matrix& Matrix::operator+=(const Matrix &mat) {
+    if (nRow != mat.nRow || nCol != mat.nCol)
+        throw std::invalid_argument("Matrix dimensions must match for addition.");
+    for (std::size_t i = 0; i < data.size(); ++i)
+        data[i] += mat.data[i];
+    return *this;
+}
+
+Matrix& Matrix::operator-=(const Matrix &mat) {
+    if (nRow != mat.nRow || nCol != mat.nCol)
+        throw std::invalid_argument("Matrix dimensions must match for subtraction.");
+    for (std::size_t i = 0; i < data.size(); ++i)
+        data[i] -= mat.data[i];
+    return *this;
+}
+
+Matrix& Matrix::operator*=(const Matrix &mat) {
+    if (nRow != mat.nRow || nCol != mat.nCol)
+        throw std::invalid_argument("Matrix dimensions must match for element-wise multiplication.");
+    for (std::size_t i = 0; i < data.size(); ++i)
+        data[i] *= mat.data[i];
+    return *this;
+}
+
+Matrix& Matrix::operator/=(const Matrix &mat) {
+    if (nRow != mat.nRow || nCol != mat.nCol)
+        throw std::invalid_argument("Matrix dimensions must match for element-wise division.");
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        if (std::abs(mat.data[i]) < 1e-12)
+            throw std::runtime_error("Division by zero in element-wise division.");
+        data[i] /= mat.data[i];
+    }
+    return *this;
+}
+
+// --- 非成员友元运算符实现 ---
+
+// 一元正号
+Matrix operator+(const Matrix &mat) {
+    return mat;
+}
+
+// 一元负号
+Matrix operator-(const Matrix &mat) {
+    Matrix result(mat.rows(), mat.cols());
+    for (std::size_t i = 0; i < mat.size(); ++i)
+        result(i) = -mat(i);
+    return result;
+}
+
+// 标量与矩阵的二元运算
+Matrix operator+(const Matrix &mat, const double val) {
+    Matrix result(mat);
+    result += val;
+    return result;
+}
+
+Matrix operator-(const Matrix &mat, const double val) {
+    Matrix result(mat);
+    result -= val;
+    return result;
+}
+
+Matrix operator*(const Matrix &mat, const double val) {
+    Matrix result(mat);
+    result *= val;
+    return result;
+}
+
+Matrix operator/(const Matrix &mat, const double val) {
+    Matrix result(mat);
+    result /= val;
+    return result;
+}
+
+Matrix operator+(const double val, const Matrix &mat) {
+    return mat + val;
+}
+
+Matrix operator-(const double val, const Matrix &mat) {
+    Matrix result(mat.rows(), mat.cols());
+    for (std::size_t i = 0; i < mat.size(); ++i)
+        result(i) = val - mat(i);
+    return result;
+}
+
+Matrix operator*(const double val, const Matrix &mat) {
+    return mat * val;
+}
+
+Matrix operator/(const double val, const Matrix &mat) {
+    Matrix result(mat.rows(), mat.cols());
+    for (std::size_t i = 0; i < mat.size(); ++i) {
+        if (std::abs(mat(i)) < 1e-12)
+            throw std::runtime_error("Division by zero in scalar/matrix division.");
+        result(i) = val / mat(i);
+    }
+    return result;
+}
+
+// 逐元素矩阵运算
+Matrix operator+(const Matrix &m1, const Matrix &m2) {
+    if (m1.rows() != m2.rows() || m1.cols() != m2.cols())
+        throw std::invalid_argument("Matrix dimensions must match for addition.");
+    Matrix result(m1);
+    result += m2;
+    return result;
+}
+
+Matrix operator-(const Matrix &m1, const Matrix &m2) {
+    if (m1.rows() != m2.rows() || m1.cols() != m2.cols())
+        throw std::invalid_argument("Matrix dimensions must match for subtraction.");
+    Matrix result(m1);
+    result -= m2;
+    return result;
+}
+
+Matrix operator*(const Matrix &m1, const Matrix &m2) {
+    if (m1.rows() != m2.rows() || m1.cols() != m2.cols())
+        throw std::invalid_argument("Matrix dimensions must match for element-wise multiplication.");
+    Matrix result(m1);
+    result *= m2;
+    return result;
+}
+
+Matrix operator/(const Matrix &m1, const Matrix &m2) {
+    if (m1.rows() != m2.rows() || m1.cols() != m2.cols())
+        throw std::invalid_argument("Matrix dimensions must match for element-wise division.");
+    Matrix result(m1);
+    result /= m2;
+    return result;
+}
+
+// 矩阵乘积（要求 m1.cols() == m2.rows()）
+Matrix operator%(const Matrix &m1, const Matrix &m2) {
+    if (m1.cols() != m2.rows())
+        throw std::invalid_argument("Matrix dimensions do not match for multiplication.");
+    Matrix result(m1.rows(), m2.cols(), 0.0);
+    for (std::size_t i = 0; i < m1.rows(); ++i) {
+        for (std::size_t j = 0; j < m2.cols(); ++j) {
+            double sum = 0.0;
+            for (std::size_t k = 0; k < m1.cols(); ++k)
+                sum += m1(i, k) * m2(k, j);
+            result(i, j) = sum;
+        }
+    }
+    return result;
+}
+
+`matrix.hpp
+#pragma once
+#include <vector>
+#include <stdexcept>
+#include <cmath>
+
+class Matrix {
+private:
+    std::size_t nRow, nCol;
+    std::vector<double> data;
+
+public:
+    Matrix();
+    Matrix(std::size_t nRow, std::size_t nCol, const double val = 0.0);
+    Matrix(std::size_t nRow, std::size_t nCol, const std::vector<double>& data);
+    Matrix(std::size_t nRow, std::size_t nCol, const Matrix& mat); // 展平构造
+
+    std::size_t rows() const;
+    std::size_t cols() const;
+    std::size_t size() const;
+
+    double operator()(std::size_t i, std::size_t j) const;
+    double& operator()(std::size_t i, std::size_t j);
+    double operator()(std::size_t i) const;
+    double& operator()(std::size_t i);
+
+    double at(std::size_t i, std::size_t j) const;
+    double& at(std::size_t i, std::size_t j);
+    double at(std::size_t i) const;
+    double& at(std::size_t i);
+
+    double norm() const;
+    Matrix trans() const;
+    Matrix inver() const;
+    Matrix solve(const Matrix& b) const;
+
+    // *this will not change
+    Matrix reshape(std::size_t r, std::size_t c) const;
+
+    Matrix& operator+=(const double val);
+    Matrix& operator-=(const double val);
+    Matrix& operator*=(const double val);
+    Matrix& operator/=(const double val);
+
+    Matrix& operator+=(const Matrix& mat);
+    Matrix& operator-=(const Matrix& mat);
+    Matrix& operator*=(const Matrix& mat);
+    Matrix& operator/=(const Matrix& mat);
+
+    friend Matrix operator+(const Matrix& mat);
+    friend Matrix operator-(const Matrix& mat);
+
+    friend Matrix operator+(const Matrix& mat, const double val);
+    friend Matrix operator-(const Matrix& mat, const double val);
+    friend Matrix operator*(const Matrix& mat, const double val);
+    friend Matrix operator/(const Matrix& mat, const double val);
+
+    friend Matrix operator+(const double val, const Matrix& mat);
+    friend Matrix operator-(const double val, const Matrix& mat);
+    friend Matrix operator*(const double val, const Matrix& mat);
+    friend Matrix operator/(const double val, const Matrix& mat);
+
+    friend Matrix operator+(const Matrix& m1, const Matrix& m2);
+    friend Matrix operator-(const Matrix& m1, const Matrix& m2);
+    friend Matrix operator*(const Matrix& m1, const Matrix& m2);
+    friend Matrix operator/(const Matrix& m1, const Matrix& m2);
+
+    friend Matrix operator%(const Matrix& m1, const Matrix& m2);
+};
+
+`molecule.cpp
+#include "molecule.hpp"
+#include <cstdlib>
+#include <fstream>
+#include <sstream>
+#include <iostream>
+
+Molecule::Molecule(const std::string& filename) {
+    std::vector<std::string> filelines;
+    
+    std::ifstream ifs(filename);
+    std::string line;
+    while (std::getline(ifs, line)) {
+        if (line.empty()) continue;
+        filelines.push_back(line);
+    }
+
+    if (filelines.size() < 2) {
+        std::cerr << "error in input file: "
+                  << filename << std::endl;
+        std::abort();
+    }
+
+    // read charge and multip
+    std::istringstream iss(filelines[0]);
+    iss >> charge >> multip;
+
+    // read symbol and coords
+    for (std::size_t i = 1; i < filelines.size(); ++i) {
+        std::istringstream iss(filelines[i]);
+
+        std::string s;
+        Vec3f64 c;
+
+        iss >> s >> c.x >> c.y >> c.z;
+
+        symbol.push_back(s);
+        coords.push_back(c);
+    }
+}
+
+std::string Molecule::to_geometry() const {
+    std::string ret;
+    char buff[128];
+
+    if (symbol.size() != coords.size()) {
+        std::cerr << "symbol.size() != coords.size()" << std::endl;
+        std::abort();
+    }
+
+    for (size_t i = 0; i < symbol.size(); i++) {
+        sprintf(buff, " %-2s %14.8lf %14.8lf %14.8lf",
+                symbol[i].data(), coords[i].x, coords[i].y, coords[i].z);
+        ret += std::string(buff) + std::string("\n");
+    }
+
+    return ret;
+}
+
+std::string Molecule::to_string() const {
+    char buff[128];
+
+    std::sprintf(buff, "%d %d", charge, multip);
+    std::string ret = std::string(buff) + std::string("\n");
+
+    return ret + this -> to_geometry();
+}
+
+std::string Molecule::to_gjf() const {
+    // std::string control = "%chk=opt.chk\n";
+    // std::string methods = "# hf/6-31g force\n";
+    // std::string comment = "calculate force\n";
+    
+    // std::string ret =   control 
+    //                   + methods + "\n"
+    //                   + comment + "\n";
+    
+    std::string methods = "# hf/6-31g force\n";
+    std::string comment = "calculate force\n";
+    
+    std::string ret =   methods + "\n"
+                      + comment + "\n";
+
+    // structure information
+    ret += this -> to_string() + "\n";
+    
+    return ret;
+}
+
+std::vector<Vec3f64> Molecule::calculate_gradient() const {
+    std::string jobname = "force";
+    std::string gjfFilename = jobname + ".gjf";
+    std::string logFilename = jobname + ".log";
+
+
+    /**********************************************************/
+    /*                   generate gjf file                    */
+    /**********************************************************/
+    std::ofstream gjfFile(gjfFilename);
+
+    if (!gjfFile.good()) {
+        std::cerr << "cannot write to " << gjfFilename << std::endl;
+        std::abort();
+    }
+
+    gjfFile << this -> to_gjf() << std::endl;
+    gjfFile.close();
+
+
+    /**********************************************************/
+    /*                    run gaussian job                    */
+    /**********************************************************/
+    std::string cmd = "g16 " + gjfFilename;
+    int ret_code = std::system(cmd.data());
+
+    if (ret_code != 0) {
+        std::cerr << "run g16 job error." << std::endl;
+        std::abort();
+    }
+
+    
+    /**********************************************************/
+    /*                     read gradient                      */
+    /**********************************************************/
+
+    // read whole log file 
+    std::vector<std::string> logFileLines;
+    std::ifstream logFile(logFilename);
+
+    if (!logFile.good()) {
+        std::cerr << "cannot read log file: " << logFilename << std::endl;
+        std::abort();
+    }
+
+    std::string line;
+    while (std::getline(logFile, line)) {
+        logFileLines.push_back(line);
+    }
+
+    // find force output position
+    std::size_t idx = 0;
+    while (idx < logFileLines.size()) {
+        const std::string& thisLine = logFileLines[idx];
+        if(thisLine.find("Forces (Hartrees/Bohr)") != std::string::npos) {
+            break;
+        }
+
+        idx++;
+    }
+
+    // force output is not found.
+    if (idx >= logFileLines.size()) {
+        std::cerr << "cannot find force in log file: " << logFilename << std::endl;
+        std::abort();
+    }
+
+    // skip following 3 lines
+    idx += 3;
+
+    // gradient to return
+    std::vector<Vec3f64> gradient;
+
+    for (; idx < logFileLines.size(); ++idx) {
+        const std::string& thisLine = logFileLines[idx];
+
+        // end of force
+        if (thisLine.find("----") != std::string::npos) {
+            break;
+        }
+
+        int num1, num2;
+        Vec3f64 force;
+
+        std::istringstream iss(thisLine);
+        iss >> num1 >> num2 >> force.x >> force.y >> force.z;
+
+        // gradient is the negative of force
+        gradient.push_back(-force);
+    }
+
+    if (gradient.size() != symbol.size()) {
+        std::cerr << "number of gradient error." << std::endl;
+        std::abort();
+    }
+
+    return gradient;
+}
+
+`molexule.hpp
+#pragma once
+
+#include <vector>
+#include <string>
+#include "vec3f64.hpp"
+
+class Molecule {
+public:
+    int charge;
+    int multip;
+
+    // std::vector<Vec3f64>     cellvec;
+
+    std::vector<std::string>    symbol;
+    std::vector<Vec3f64>        coords;
+
+    Molecule(): charge(0), multip(0) {} 
+    Molecule(const std::string& filename);
+
+    std::string to_geometry() const;
+    std::string to_string() const;
+    std::string to_gjf() const;
+
+    std::vector<Vec3f64> calculate_gradient() const;
+};
+
+`utility.cpp
+
+#include "utility.hpp"
+#include <cstddef>
+#include <iostream>
+#include <cstdlib>
+
+Matrix vec3f64Vector_to_matrix(const std::vector<Vec3f64>& vec) {
+    std::size_t n = vec.size();
+    Matrix ret(n, 3);
+
+    for (std::size_t i = 0; i < n; ++i) {
+        ret(i, 0) = vec[i].x;
+        ret(i, 1) = vec[i].y;
+        ret(i, 2) = vec[i].z;
+    }
+
+    return ret;
+}
+
+std::vector<Vec3f64> matrix_to_vec3f64Vector(const Matrix& mat) {
+    if (mat.cols() != 3) {
+        std::cerr << "matrix dim error: cols != 3." << std::endl;
+        std::abort();
+    }
+
+    std::size_t n = mat.rows();
+    std::vector<Vec3f64> vec(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        vec[i].x = mat(i, 0);
+        vec[i].y = mat(i, 1);
+        vec[i].z = mat(i, 2);
+    }
+
+    return vec;
+}
+
+`utility.hpp
+#pragma once
+
+#include "matrix.hpp"
+#include "vec3f64.hpp"
+#include <vector>
+
+Matrix vec3f64Vector_to_matrix(const std::vector<Vec3f64>& vec);
+std::vector<Vec3f64> matrix_to_vec3f64Vector(const Matrix& mat);
+
+`vec3f64.cpp
+#include "vec3f64.hpp"
+#include <string>
+#include <sstream>
+#include <cstdio>
+#include <cmath>
+#include <cassert>
+#include <cstdlib>
+#include <iostream>
+
+Vec3f64::Vec3f64() : x(0.0), y(0.0), z(0.0) {}
+
+Vec3f64::Vec3f64(double x, double y, double z)
+: x(x), y(y), z(z) {}
+
+Vec3f64::Vec3f64(const std::string &input) {
+    std::istringstream iss(input);
+    iss >> x >> y >> z;
+}
+
+double Vec3f64::len() const
+{ return std::sqrt(x*x + y*y + z*z); }
+
+double Vec3f64::len2() const
+{ return x*x + y*y + z*z; }
+
+std::string Vec3f64::to_string() const {
+    char buff[128];
+    std::sprintf(buff, " %16.8lf %16.8lf %16.8lf", x, y, z);
+    return std::string(buff);
+}
+
+/* access operator */
+double  Vec3f64::operator[](std::size_t i) const {
+    assert(i < 3);
+    switch (i) {
+        case 0: return x;
+        case 1: return y;
+        case 2: return z;
+        default: std::abort(); // shouldn't be reached
+    }
+
+    return 0.0;
+}
+
+double& Vec3f64::operator[](std::size_t i) {
+    assert(i < 3);
+    switch (i) {
+        case 0: return x;
+        case 1: return y;
+        case 2: return z;
+        default: std::abort(); // shouldn't be reached
+    }
+
+    return x;
+}
+
+/* same as operator[] */
+double Vec3f64::at(std::size_t i) const {
+    if (i >= 3) {
+        std::cerr << "Vec3f64::at(std::size_t i) error:" << std::endl;
+        std::cerr << "index out of range: i = " << i << std::endl;
+        std::abort();
+    }
+
+    return (*this)[i];
+}
+
+double& Vec3f64::at(std::size_t i) {
+    if (i >= 3) {
+        std::cerr << "Vec3f64::at(std::size_t i) error:" << std::endl;
+        std::cerr << "index out of range: i = " << i << std::endl;
+        std::abort();
+    }
+
+    return (*this)[i];
+}
+
+Vec3f64& Vec3f64::operator+=(const Vec3f64 &vec)
+{ x += vec.x; y += vec.y; z += vec.z; return *this; }
+
+Vec3f64& Vec3f64::operator-=(const Vec3f64 &vec)
+{ x -= vec.x; y -= vec.y; z -= vec.z; return *this; }
+
+Vec3f64& Vec3f64::operator*=(const Vec3f64 &vec)
+{ x *= vec.x; y *= vec.y; z *= vec.z; return *this; }
+
+Vec3f64& Vec3f64::operator/=(const Vec3f64 &vec)
+{ x /= vec.x; y /= vec.y; z /= vec.z; return *this; }
+
+Vec3f64&  Vec3f64::operator+=(double val)
+{ x += val; y += val; z += val; return *this; }
+
+Vec3f64&  Vec3f64::operator-=(double val)
+{ x -= val; y -= val; z -= val; return *this; }
+
+Vec3f64&  Vec3f64::operator*=(double val)
+{ x *= val; y *= val; z *= val; return *this; }
+
+Vec3f64&  Vec3f64::operator/=(double val)
+{ x /= val; y /= val; z /= val; return *this; }
+
+
+/*  operators */
+Vec3f64 operator+(const Vec3f64 &vec)
+{ return Vec3f64(+vec.x, +vec.y, +vec.z); }
+
+Vec3f64 operator-(const Vec3f64 &vec)
+{ return Vec3f64(-vec.x, -vec.y, -vec.z); }
+
+
+Vec3f64  operator+(const Vec3f64 &vec1, const Vec3f64 &vec2)
+{ return Vec3f64(vec1.x + vec2.x, vec1.y + vec2.y, vec1.z + vec2.z); }
+
+Vec3f64  operator-(const Vec3f64 &vec1, const Vec3f64 &vec2)
+{ return Vec3f64(vec1.x - vec2.x, vec1.y - vec2.y, vec1.z - vec2.z); }
+
+Vec3f64  operator*(const Vec3f64 &vec1, const Vec3f64 &vec2)
+{ return Vec3f64(vec1.x * vec2.x, vec1.y * vec2.y, vec1.z * vec2.z); }
+
+Vec3f64  operator/(const Vec3f64 &vec1, const Vec3f64 &vec2)
+{ return Vec3f64(vec1.x / vec2.x, vec1.y / vec2.y, vec1.z / vec2.z); }
+
+Vec3f64  operator+(const Vec3f64 &vec, double val)
+{ return Vec3f64(vec.x + val, vec.y + val, vec.z + val); }
+
+Vec3f64  operator-(const Vec3f64 &vec, double val)
+{ return Vec3f64(vec.x - val, vec.y - val, vec.z - val); }
+
+Vec3f64  operator*(const Vec3f64 &vec, double val)
+{ return Vec3f64(vec.x * val, vec.y * val, vec.z * val); }
+
+Vec3f64  operator/(const Vec3f64 &vec, double val)
+{ return Vec3f64(vec.x / val, vec.y / val, vec.z / val); }
+
+Vec3f64  operator+(double val, const Vec3f64 &vec)
+{ return Vec3f64(val + vec.x, val + vec.y, val + vec.z); }
+
+Vec3f64  operator-(double val, const Vec3f64 &vec)
+{ return Vec3f64(val - vec.x, val - vec.y, val - vec.z); }
+
+Vec3f64  operator*(double val, const Vec3f64 &vec)
+{ return Vec3f64(val * vec.x, val * vec.y, val * vec.z); }
+
+Vec3f64  operator/(double val, const Vec3f64 &vec)
+{ return Vec3f64(val / vec.x, val / vec.y, val / vec.z); }
+
+/* dot product */
+double dot(const Vec3f64 &vec1, const Vec3f64 &vec2)
+{ return vec1.x * vec2.x + vec1.y * vec2.y + vec1.z * vec2.z; }
+
+/* cross product */
+Vec3f64 crs(const Vec3f64 &vec1, const Vec3f64 &vec2) {
+    return Vec3f64(
+        vec1.y * vec2.z - vec1.z * vec2.y,
+        vec1.z * vec2.x - vec1.x * vec2.z,
+        vec1.x * vec2.y - vec1.y * vec2.x
+    );
+}
+
+`vec3f64.hpp
+
+#pragma once
+
+#include <string>
+#include <cstddef>
+
+// Vec3d is a class for representing
+// a vector or a point in 3D space.
+class Vec3f64 {
+public:
+    double x, y, z;
+
+    explicit Vec3f64();
+    explicit Vec3f64(const std::string &input);
+    explicit Vec3f64(double x, double y, double z);
+
+    double len() const;
+    double len2() const;
+    std::string to_string() const;
+
+    /* access operator */
+    double  operator[](std::size_t i) const;
+    double& operator[](std::size_t i);
+
+    /* runtime range check */
+    double  at(std::size_t i) const;
+    double& at(std::size_t i);
+
+    Vec3f64&  operator+=(const Vec3f64 &vec);
+    Vec3f64&  operator-=(const Vec3f64 &vec);
+    Vec3f64&  operator*=(const Vec3f64 &vec);
+    Vec3f64&  operator/=(const Vec3f64 &vec);
+    Vec3f64&  operator+=(double val);
+    Vec3f64&  operator-=(double val);
+    Vec3f64&  operator*=(double val);
+    Vec3f64&  operator/=(double val);
+};
+
+Vec3f64  operator+(const Vec3f64 &vec); // positive
+Vec3f64  operator-(const Vec3f64 &vec); // negative
+Vec3f64  operator+(const Vec3f64 &vec1, const Vec3f64 &vec2);
+Vec3f64  operator-(const Vec3f64 &vec1, const Vec3f64 &vec2);
+Vec3f64  operator*(const Vec3f64 &vec1, const Vec3f64 &vec2);
+Vec3f64  operator/(const Vec3f64 &vec1, const Vec3f64 &vec2);
+Vec3f64  operator+(const Vec3f64 &vec, double val);
+Vec3f64  operator-(const Vec3f64 &vec, double val);
+Vec3f64  operator*(const Vec3f64 &vec, double val);
+Vec3f64  operator/(const Vec3f64 &vec, double val);
+Vec3f64  operator+(double val, const Vec3f64 &vec);
+Vec3f64  operator-(double val, const Vec3f64 &vec);
+Vec3f64  operator*(double val, const Vec3f64 &vec);
+Vec3f64  operator/(double val, const Vec3f64 &vec);
+
+/* dot product */
+double  dot(const Vec3f64 &vec1, const Vec3f64 &vec2);
+
+/* cross product */
+Vec3f64 crs(const Vec3f64 &vec1, const Vec3f64 &vec2);
+
+`cmake_minimum_required(VERSION 3.11)
+
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+project(hf-opt LANGUAGES C CXX)
+
+add_subdirectory(src)
