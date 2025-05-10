@@ -1,4 +1,4 @@
-main2.cpp
+`main2.cpp
 
 #include "molecule.hpp"
 #include "utility.hpp"
@@ -96,6 +96,7 @@ int main(int argc, char** argv) {
 }
 
 `gdiis.cpp
+
 #include "gdiis.hpp"
 #include <cassert>
 
@@ -142,6 +143,7 @@ Matrix GDIIS::update(const Matrix& x, const Matrix& r) {
 }
 
 `gdiis.hpp
+
 #pragma once
 
 #include "matrix.hpp"
