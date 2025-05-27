@@ -1,102 +1,112 @@
-`main2.cpp
+`main.cpp
+// File: src/main2.cpp
 
 #include "molecule.hpp"
 #include "utility.hpp"
 #include "gdiis.hpp"
+
 #include <iostream>
 #include <cstdlib>
 #include <algorithm>
 
+// 判断所有原子梯度范数是否都小于阈值
 bool converged(const std::vector<Vec3f64>& grads, double thresh) {
-    for (const Vec3f64& g : grads) {
-        double norm = g.len();
-        if (norm > thresh) return false;
+    for (const auto& g : grads) {
+        if (g.len() > thresh) return false;
     }
     return true;
 }
 
+// 计算最大梯度范数
 double max_gradient(const std::vector<Vec3f64>& grads) {
-    double maxGrad = 0;
-
-    for (const Vec3f64& g : grads) {
-        double norm = g.len();
-        maxGrad = std::max(norm, maxGrad);
+    double maxG = 0.0;
+    for (const auto& g : grads) {
+        maxG = std::max(maxG, g.len());
     }
-
-    return maxGrad;
+    return maxG;
 }
 
 int main(int argc, char** argv) {
     if (argc != 2) {
-        std::cerr << "usage: opt mol.txt" << std::endl;
-        std::abort();
+        std::cerr << "usage: opt mol.txt\n";
+        return 1;
     }
 
-    Molecule mol(argv[1]);
+    Molecule mol = Molecule::from_gjf(argv[1]);
     std::size_t nAtom = mol.coords.size();
 
-    int max_iter = 100;
-    double threshold = 1e-4;
-    bool is_converged = false;
+    const int    max_iter  = 100;
+    const double thresh    = 1e-4;
+    const double alpha     = 0.1;  // 简单松弛步长
+    bool         is_conv   = false;
 
-    GDIIS gdiis;
-    std::vector<Vec3f64> grads;
-    std::vector<std::vector<Vec3f64>> grad_hist;
+    GDIIS                             diis;
+    std::vector<Vec3f64>              grads;
+    std::vector<std::vector<Vec3f64>> grad_hist;  // 若你还想保留梯度历史
 
     for (std::size_t iter = 1; iter <= max_iter; ++iter) {
+        // 1) 计算梯度
         grads = mol.calculate_gradient();
+        double maxG = max_gradient(grads);
+        std::printf("iter = %2zu, max grad = %.6f\n", iter, maxG);
 
-        double maxGrad = max_gradient(grads);
-        std::printf("iter = %ld, max grad = %.6lf\n", iter, maxGrad);
-
-        if (converged(grads, threshold)) {
-            is_converged = true;
+        // 2) 收敛检查
+        if (converged(grads, thresh)) {
+            is_conv = true;
             break;
         }
 
+        // 3)  construct “simple relaxation” erroe vector e_i = x_i^SR - x_i，
+        //    其中 x_i^SR = x_i - alpha * grad_i
         std::vector<Vec3f64> error_vec(nAtom);
-        if (iter == 1) {
-            error_vec = grads;
-        } else {
-            const auto& prev = grad_hist.back();
-            for (std::size_t i = 0; i < nAtom; ++i) {
-                error_vec[i] = grads[i] - prev[i];
-            }
+        for (std::size_t i = 0; i < nAtom; ++i) {
+            Vec3f64 xi = mol.coords[i];
+            Vec3f64 shift = grads[i] * (-alpha);
+            Vec3f64 x_sr = xi + shift;
+            error_vec[i] = x_sr - xi;  // e_i x_i^SR-x_i=H^-1*fi
         }
+
+        // （可选）保存梯度历史
         grad_hist.push_back(grads);
 
-        Matrix errMat = vec3f64Vector_to_matrix(error_vec)
-                            .reshape(3 * nAtom, 1);
-        Matrix xMat   = vec3f64Vector_to_matrix(mol.coords)
-                            .reshape(3 * nAtom, 1);
+        // 4) 打包成 Matrix
+        Matrix xMat = vec3f64Vector_to_matrix(mol.coords)
+                          .reshape(3 * nAtom, 1);
+        Matrix rMat = vec3f64Vector_to_matrix(error_vec)
+                          .reshape(3 * nAtom, 1);
 
-        Matrix xNew = gdiis.update(xMat, errMat);
+        // 5) 调用 DIIS 更新：内部自己维护历史 / 构建方程 / 求解混合系数
+        Matrix xNew = diis.update(xMat, rMat);
 
-        auto new_coords = matrix_to_vec3f64Vector(
-                               xNew.reshape(nAtom, 3)
-                           );
-        mol.coords = new_coords;
+        // 6) 若 DIIS 返回 NaN，就退化到单步
+        bool hasNaN = false;
+        for (std::size_t k = 0; k < xNew.size(); ++k) {
+            if (std::isnan(xNew(k))) {
+                hasNaN = true;
+                break;
+            }
+        }
+        if (hasNaN) {
+            std::cerr << "[DIIS] ❌ NaN detected, fallback to simple SR step\n";
+            xNew = xMat + rMat;  // x_sr
+        }
+
+        // 7) 写回坐标
+        mol.coords = matrix_to_vec3f64Vector(xNew.reshape(nAtom, 3));
     }
 
-    if (is_converged) {
-        std::cout << "converged." << std::endl;
-    } else {
-        std::cout << "not converged" << std::endl;
-    }
+    std::cout << (is_conv ? "converged.\n" : "not converged\n");
 
-    std::cout << "Final structure: " << std::endl;
-    std::cout << mol.to_geometry() << std::endl;
-
-    std::cout << "Final forces (Hartrees/Bohr): " << std::endl;
-    for (std::size_t i = 0; i < grads.size(); ++i) {
-        std::cout << grads[i].to_string() << std::endl;
+    std::cout << "Final structure:\n" << mol.to_geometry() << "\n";
+    std::cout << "Final forces:\n";
+    for (auto& g : grads) {
+        std::cout << g.to_string() << "\n";
     }
 
     return 0;
 }
 
 `gdiis.cpp
-
 #include "gdiis.hpp"
 #include <cassert>
 
@@ -484,6 +494,7 @@ Matrix operator%(const Matrix &m1, const Matrix &m2) {
     return result;
 }
 
+
 `matrix.hpp
 #pragma once
 #include <vector>
@@ -561,9 +572,13 @@ public:
 #include <sstream>
 #include <iostream>
 
+// ✅ 默认构造函数定义（补上这句解决链接错误）
+Molecule::Molecule() : charge(0), multip(1) {}
+
+// 构造函数：从自定义格式文本读取
 Molecule::Molecule(const std::string& filename) {
     std::vector<std::string> filelines;
-    
+
     std::ifstream ifs(filename);
     std::string line;
     while (std::getline(ifs, line)) {
@@ -572,29 +587,65 @@ Molecule::Molecule(const std::string& filename) {
     }
 
     if (filelines.size() < 2) {
-        std::cerr << "error in input file: "
-                  << filename << std::endl;
+        std::cerr << "error in input file: " << filename << std::endl;
         std::abort();
     }
 
-    // read charge and multip
     std::istringstream iss(filelines[0]);
     iss >> charge >> multip;
 
-    // read symbol and coords
     for (std::size_t i = 1; i < filelines.size(); ++i) {
         std::istringstream iss(filelines[i]);
-
         std::string s;
         Vec3f64 c;
-
         iss >> s >> c.x >> c.y >> c.z;
-
         symbol.push_back(s);
         coords.push_back(c);
     }
 }
 
+// ✅ from_gjf 静态方法：从 Gaussian-like 文件提取结构
+Molecule Molecule::from_gjf(const std::string& filename) {
+    Molecule mol;
+    std::ifstream fin(filename);
+    if (!fin) {
+        std::cerr << "❌ Failed to open GJF file: " << filename << std::endl;
+        std::abort();
+    }
+
+    std::string line;
+    bool reading_atoms = false;
+
+    while (std::getline(fin, line)) {
+        if (line.empty()) {
+            if (reading_atoms) break;
+            continue;
+        }
+
+        std::istringstream iss(line);
+        std::string symbol;
+        double x, y, z;
+
+        if (iss >> symbol >> x >> y >> z) {
+            reading_atoms = true;
+            mol.symbol.push_back(symbol);
+            mol.coords.push_back(Vec3f64{x, y, z});
+        } else if (reading_atoms) {
+            break;
+        }
+    }
+
+    if (mol.coords.empty()) {
+        std::cerr << "❌ No atoms parsed from GJF file: " << filename << std::endl;
+        std::abort();
+    }
+
+    mol.charge = 0;
+    mol.multip = 1;
+    return mol;
+}
+
+// 输出 Gaussian 坐标块（用于 .gjf）
 std::string Molecule::to_geometry() const {
     std::string ret;
     char buff[128];
@@ -607,131 +658,87 @@ std::string Molecule::to_geometry() const {
     for (size_t i = 0; i < symbol.size(); i++) {
         sprintf(buff, " %-2s %14.8lf %14.8lf %14.8lf",
                 symbol[i].data(), coords[i].x, coords[i].y, coords[i].z);
-        ret += std::string(buff) + std::string("\n");
+        ret += std::string(buff) + "\n";
     }
 
     return ret;
 }
 
+// 输出为 gjf 坐标段（带电荷、自旋多重度）
 std::string Molecule::to_string() const {
     char buff[128];
-
     std::sprintf(buff, "%d %d", charge, multip);
-    std::string ret = std::string(buff) + std::string("\n");
-
-    return ret + this -> to_geometry();
+    std::string ret = std::string(buff) + "\n";
+    return ret + this->to_geometry();
 }
 
+// 生成完整 Gaussian 输入文件内容
 std::string Molecule::to_gjf() const {
-    // std::string control = "%chk=opt.chk\n";
-    // std::string methods = "# hf/6-31g force\n";
-    // std::string comment = "calculate force\n";
-    
-    // std::string ret =   control 
-    //                   + methods + "\n"
-    //                   + comment + "\n";
-    
     std::string methods = "# hf/6-31g force\n";
     std::string comment = "calculate force\n";
-    
-    std::string ret =   methods + "\n"
-                      + comment + "\n";
-
-    // structure information
-    ret += this -> to_string() + "\n";
-    
+    std::string ret = methods + "\n" + comment + "\n";
+    ret += this->to_string() + "\n";
     return ret;
 }
 
+// 调用 Gaussian 并解析力（负梯度）
 std::vector<Vec3f64> Molecule::calculate_gradient() const {
-    std::string jobname = "force";
+    std::string jobname     = "force";
     std::string gjfFilename = jobname + ".gjf";
     std::string logFilename = jobname + ".log";
 
-
-    /**********************************************************/
-    /*                   generate gjf file                    */
-    /**********************************************************/
     std::ofstream gjfFile(gjfFilename);
-
     if (!gjfFile.good()) {
         std::cerr << "cannot write to " << gjfFilename << std::endl;
         std::abort();
     }
 
-    gjfFile << this -> to_gjf() << std::endl;
+    gjfFile << this->to_gjf() << std::endl;
     gjfFile.close();
 
-
-    /**********************************************************/
-    /*                    run gaussian job                    */
-    /**********************************************************/
     std::string cmd = "g16 " + gjfFilename;
     int ret_code = std::system(cmd.data());
-
     if (ret_code != 0) {
         std::cerr << "run g16 job error." << std::endl;
         std::abort();
     }
 
-    
-    /**********************************************************/
-    /*                     read gradient                      */
-    /**********************************************************/
-
-    // read whole log file 
-    std::vector<std::string> logFileLines;
     std::ifstream logFile(logFilename);
-
     if (!logFile.good()) {
         std::cerr << "cannot read log file: " << logFilename << std::endl;
         std::abort();
     }
 
+    std::vector<std::string> logFileLines;
     std::string line;
     while (std::getline(logFile, line)) {
         logFileLines.push_back(line);
     }
 
-    // find force output position
     std::size_t idx = 0;
     while (idx < logFileLines.size()) {
-        const std::string& thisLine = logFileLines[idx];
-        if(thisLine.find("Forces (Hartrees/Bohr)") != std::string::npos) {
+        if (logFileLines[idx].find("Forces (Hartrees/Bohr)") != std::string::npos)
             break;
-        }
-
-        idx++;
+        ++idx;
     }
 
-    // force output is not found.
     if (idx >= logFileLines.size()) {
         std::cerr << "cannot find force in log file: " << logFilename << std::endl;
         std::abort();
     }
 
-    // skip following 3 lines
     idx += 3;
-
-    // gradient to return
     std::vector<Vec3f64> gradient;
 
     for (; idx < logFileLines.size(); ++idx) {
-        const std::string& thisLine = logFileLines[idx];
-
-        // end of force
-        if (thisLine.find("----") != std::string::npos) {
-            break;
-        }
+        if (logFileLines[idx].find("----") != std::string::npos) break;
 
         int num1, num2;
         Vec3f64 force;
-
-        std::istringstream iss(thisLine);
+        std::istringstream iss(logFileLines[idx]);
         iss >> num1 >> num2 >> force.x >> force.y >> force.z;
 
-        // gradient is the negative of force
-        gradient.push_back(-force);
+        gradient.push_back(-force); // 负力 = 梯度
     }
 
     if (gradient.size() != symbol.size()) {
@@ -741,6 +748,7 @@ std::vector<Vec3f64> Molecule::calculate_gradient() const {
 
     return gradient;
 }
+
 
 `molexule.hpp
 #pragma once
@@ -758,9 +766,11 @@ public:
 
     std::vector<std::string>    symbol;
     std::vector<Vec3f64>        coords;
-
-    Molecule(): charge(0), multip(0) {} 
+    Molecule();
     Molecule(const std::string& filename);
+
+    // ✅ 声明 from_gjf 方法
+    static Molecule from_gjf(const std::string& filename);
 
     std::string to_geometry() const;
     std::string to_string() const;
@@ -1036,7 +1046,8 @@ double  dot(const Vec3f64 &vec1, const Vec3f64 &vec2);
 /* cross product */
 Vec3f64 crs(const Vec3f64 &vec1, const Vec3f64 &vec2);
 
-`cmake_minimum_required(VERSION 3.11)
+大的Cmake list
+cmake_minimum_required(VERSION 3.11)
 
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -1045,3 +1056,34 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 project(hf-opt LANGUAGES C CXX)
 
 add_subdirectory(src)
+
+ 小Cmakelisrt
+# src/CMakeLists.txt
+
+add_executable(
+  optimizer
+  matrix.cpp
+  vec3f64.cpp
+  utility.cpp
+  molecule.cpp
+  gdiis.cpp
+  main2.cpp
+)
+
+
+
+# set(SOURCES
+#   matrix.cpp
+#   vec3f64.cpp
+#   utility.cpp
+#   molecule.cpp
+#   test_mol.cpp
+
+#   # main.cpp
+#   # optimizer.cpp
+#   # gaussian_parser.cpp
+#   # gjf_generator.cpp
+# )
+
+# add_executable(optimizer ${SOURCES})
+
