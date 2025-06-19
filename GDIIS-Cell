@@ -1,0 +1,220 @@
+`cell.cpp
+// File: cell.cpp
+#include "cell.hpp"
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <cstdlib>
+
+
+// 默认构造函数
+Cell::Cell() {
+    std::system(
+      "rm -rf "
+      "CHG CHGCAR WAVECAR OUTCAR "
+      "OSZICAR vasprun.xml vasp.log "
+      "DOSCAR EIGENVAL IBZKPT XDATCAR "
+      "PCDAT CONTCAR REPORT force.* "
+    );
+}
+
+Cell Cell::from_poscar(const std::string& filename) {
+    Cell cell;
+    std::ifstream fin(filename);
+    if (!fin) {
+        std::cerr << "❌ Failed to open POSCAR file: " << filename << "\n";
+        std::abort();
+    }
+
+    std::string line;
+    std::getline(fin, line);  // comment
+
+    std::getline(fin, line);  // scale factor
+    double scale = std::stod(line);
+
+    // 读取 lattice 向量
+    cell.lattice.resize(3);
+    for (int i = 0; i < 3; ++i) {
+        std::getline(fin, line);
+        std::istringstream iss(line);
+        iss >> cell.lattice[i].x >> cell.lattice[i].y >> cell.lattice[i].z;
+        cell.lattice[i] = cell.lattice[i] * scale;
+    }
+
+    // 元素类型
+    std::getline(fin, line);
+    std::istringstream iss_species(line);
+    std::string sp;
+    while (iss_species >> sp) cell.species.push_back(sp);
+
+    // 各元素个数
+    std::getline(fin, line);
+    std::istringstream iss_num(line);
+    int count;
+    while (iss_num >> count) cell.num_atoms.push_back(count);
+
+    // 构造每个原子的元素符号
+    for (size_t i = 0; i < cell.species.size(); ++i)
+        for (int j = 0; j < cell.num_atoms[i]; ++j)
+            cell.symbols.push_back(cell.species[i]);
+
+    bool isDirect = false;
+    // 坐标类型判断行
+    while (std::getline(fin, line)) {
+        if (line.find("Direct") != std::string::npos) {
+            isDirect = true;
+            break;
+        }
+
+        if (line.find("Cartesian") != std::string::npos) {
+            break;
+        }
+    }
+
+    // 读取坐标
+    cell.coords.clear();
+    for (size_t i = 0; i < cell.symbols.size(); ++i) {
+        Vec3f64 pos;
+        fin >> pos.x >> pos.y >> pos.z;
+
+        if (isDirect) {
+            pos = pos.x * cell.lattice[0] + pos.y * cell.lattice[1] + pos.z * cell.lattice[2];
+        }
+
+        cell.coords.push_back(pos);
+    }
+
+    if (cell.coords.size() != cell.symbols.size()) {
+        std::cerr << "❌ Coordinate number mismatch (" << cell.coords.size()
+                  << " vs " << cell.symbols.size() << ").\n";
+        std::abort();
+    }
+
+    return cell;
+}
+
+std::string Cell::to_geometry() const {
+    std::ostringstream oss;
+    for (size_t i = 0; i < coords.size(); ++i)
+        oss << symbols[i] << "  " << coords[i].x << "  "
+            << coords[i].y << "  " << coords[i].z << "\n";
+    return oss.str();
+}
+
+std::string Cell::to_poscar() const {
+    std::ostringstream oss;
+    oss << "VASP cell\n1.0\n";
+    for (const auto& vec : lattice)
+        // oss << vec.x << " " << vec.y << " " << vec.z << "\n";
+        oss << vec.to_string() << std::endl;
+    for (const auto& sp : species)
+        oss << sp << " ";
+    oss << "\n";
+    for (const auto& num : num_atoms)
+        oss << num << " ";
+    oss << "\nCartesian\n";
+    for (const auto& c : coords)
+        // oss << c.x << " " << c.y << " " << c.z << "\n";
+        oss << c.to_string() << std::endl;
+    return oss.str();
+}
+
+std::vector<Vec3f64> Cell::calculate_gradient_from_vasp() const {
+
+    // 写 POSCAR
+    std::ofstream fout("POSCAR");
+    if (!fout) {
+        std::cerr << "❌ Cannot write POSCAR file.\n";
+        std::abort();
+    }
+
+    fout << this -> to_poscar();
+    fout.close();
+
+    // 写 POTCAR
+    int code0 = std::system("echo 103 | vaspkit > /dev/null");
+    if (code0 != 0) {
+        std::cerr << "❌ Failed to generate POTCAR.\n";
+        std::abort();
+    }
+
+    // 写 INCAR
+    std::ofstream incar("INCAR");
+    incar << 
+R"(PREC = ACCURATE
+IBRION  = -1
+NSW     = 0
+ENCUT   = 500
+EDIFF   = 1e-06
+EDIFFG  = -0.02
+IVDW    = 12
+ISMEAR  = 1
+SIGMA   = 0.1
+ISIF    = 2
+ISPIN   = 1
+# LDIPOL  = .TRUE.
+# IDIPOL  = 3
+ISTART  = 1
+ICHARG  = 1)";
+
+    incar.close();
+
+    // 写 KPOINTS
+    std::ofstream kpoints("KPOINTS");
+    kpoints << "Gamma-point only\n0\nGamma\n1 1 1\n";
+    kpoints.close();
+
+    std::cout << "📎 Expecting POTCAR in working directory\n";
+    std::cout << "⚙️  Running VASP (vasp_std > out.log)...\n";
+
+    int code = std::system("mpirun -np 16 vasp_gam > vasp.log");
+    if (code != 0) {
+        std::cerr << "❌ VASP execution failed.\n";
+        std::abort();
+    }
+
+    // 解析 OUTCAR 中的 TOTAL-FORCE
+    std::ifstream log("OUTCAR");
+    if (!log) {
+        std::cerr << "❌ Cannot open OUTCAR.\n";
+        std::abort();
+    }
+
+    const double sc = 0.0194469;
+
+    std::vector<Vec3f64> forces;
+    std::string line;
+    while (std::getline(log, line)) {
+        if (line.find("TOTAL-FORCE (eV/Angst)") != std::string::npos) {
+            std::getline(log, line); // --------
+
+            while (std::getline(log, line)) {
+                if (line.find("--------") != std::string::npos) {
+                    break;
+                }
+
+                std::istringstream iss(line);
+                double x, y, z, fx, fy, fz;
+                iss >> x >> y >> z >> fx >> fy >> fz;
+                forces.push_back(Vec3f64(-fx, -fy, -fz) * sc);
+            }
+
+            break;
+        }
+    }
+
+    if (forces.size() != coords.size()) {
+        std::cerr << "❌ Parsed force number mismatch (" << forces.size()
+                  << " vs " << coords.size() << ").\n";
+        std::abort();
+    }
+
+    return forces;
+}
+
+
+std::vector<Vec3f64> Cell::calculate_gradient_from_gauss() const {
+    
+}
+
+·cell.hpp
