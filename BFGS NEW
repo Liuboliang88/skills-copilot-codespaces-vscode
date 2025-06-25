@@ -1,0 +1,750 @@
+`cell.cpp
+// File: cell.cpp
+#include "cell.hpp"
+#include <fstream>
+#include <sstream>
+#include <iostream>
+#include <cstdlib>
+#include <cmath>
+
+// 默认构造函数
+Cell::Cell() {
+    std::system(
+      "rm -rf "
+      "CHG CHGCAR WAVECAR OUTCAR "
+      "OSZICAR vasprun.xml vasp.log "
+      "DOSCAR EIGENVAL IBZKPT XDATCAR "
+      "PCDAT CONTCAR REPORT force.* "
+    );
+}
+
+Cell Cell::from_poscar(const std::string& filename) {
+    Cell cell;
+    std::ifstream fin(filename);
+    if (!fin) {
+        std::cerr << "❌ Failed to open POSCAR file: " << filename << "\n";
+        std::abort();
+    }
+    // 1) header + scale
+    std::string line;
+    std::getline(fin, line);  // comment
+
+    std::getline(fin, line);  // scale factor
+    double scale = std::stod(line);
+
+    //  2) lattice vectors
+    cell.lattice.resize(3);
+    for (int i = 0; i < 3; ++i) {
+        std::getline(fin, line);
+        std::istringstream iss(line);
+        iss >> cell.lattice[i].x >> cell.lattice[i].y >> cell.lattice[i].z;
+        cell.lattice[i] = cell.lattice[i] * scale;
+    }
+
+    //  3) species & counts
+    std::getline(fin, line);
+    std::istringstream iss_species(line);
+    std::string sp;
+    while (iss_species >> sp) cell.species.push_back(sp);
+
+    
+    std::getline(fin, line);
+    std::istringstream iss_num(line);
+    int count;
+    while (iss_num >> count) cell.num_atoms.push_back(count);
+
+    // 4) build symbol list
+    for (size_t i = 0; i < cell.species.size(); ++i)
+        for (int j = 0; j < cell.num_atoms[i]; ++j)
+            cell.symbols.push_back(cell.species[i]);
+
+    // 5) detect "Direct" or "Cartesian" line
+    bool is_direct = false;
+    while (std::getline(fin, line)) {
+        if (line.find("Direct") != std::string::npos) {
+            is_direct = true;
+            break;
+        }
+        if (line.find("Cartesian") != std::string::npos) {
+            is_direct = false;
+            break;
+        }
+    }
+
+    // 6) read coordinates, 并在 fraction 模式下转换到 Cartesian
+      cell.coords.resize(cell.symbols.size());
+    for (size_t i = 0; i < cell.coords.size(); ++i) {
+        Vec3f64 f;  // 如果是 Direct，先读到分数坐标
+        fin >> f.x >> f.y >> f.z;
+        if (is_direct) {
+            // Cartesian = f.x·a + f.y·b + f.z·c
+            Vec3f64 C = cell.lattice[0] * f.x
+                      + cell.lattice[1] * f.y
+                      + cell.lattice[2] * f.z;
+            cell.coords[i] = C;
+        } else {
+            cell.coords[i] = f;
+        }
+    }
+
+    return cell;
+}
+
+std::string Cell::to_geometry() const {
+    std::ostringstream oss;
+    for (size_t i = 0; i < coords.size(); ++i)
+        oss << symbols[i] << "  " << coords[i].x << "  "
+            << coords[i].y << "  " << coords[i].z << "\n";
+    return oss.str();
+}
+
+std::string Cell::to_poscar() const {
+    std::ostringstream oss;
+    oss << "VASP cell\n1.0\n";
+    for (const auto& vec : lattice)
+        // oss << vec.x << " " << vec.y << " " << vec.z << "\n";
+        oss << vec.to_string() << std::endl;
+    for (const auto& sp : species)
+        oss << sp << " ";
+    oss << "\n";
+    for (const auto& num : num_atoms)
+        oss << num << " ";
+    oss << "\nCartesian\n";
+    for (const auto& c : coords)
+        // oss << c.x << " " << c.y << " " << c.z << "\n";
+        oss << c.to_string() << std::endl;
+    return oss.str();
+}
+
+std::vector<Vec3f64> Cell::calculate_gradient_from_vasp() const {
+    const std::string job = "force";
+    // 写 POSCAR
+    std::ofstream fout("POSCAR");
+    if (!fout) {
+        std::cerr << "❌ Cannot write POSCAR file.\n";
+        std::abort();
+    }
+
+    fout << this -> to_poscar();
+    fout.close();
+
+    // 写 POTCAR
+    int code0 = std::system("echo 103 | vaspkit > /dev/null");
+    if (code0 != 0) {
+        std::cerr << "❌ Failed to generate POTCAR.\n";
+        std::abort();
+    }
+
+    // 写 INCAR
+    std::ofstream incar("INCAR");
+    incar << 
+R"(PREC = ACCURATE
+IBRION  = -1
+NSW     = 0
+ENCUT   = 400
+EDIFF   = 1e-06
+EDIFFG  = -0.02
+IVDW    = 12
+ISMEAR  = 0
+SIGMA   = 0.05
+ISIF    = 2
+ISPIN   = 1
+# LDIPOL  = .TRUE.
+# IDIPOL  = 3
+LERAL   = Auto
+ISTART  = 0
+ICHARG  = 2)";
+
+    incar.close();
+
+    // 写 KPOINTS
+    std::ofstream kpoints("KPOINTS");
+    kpoints << "Gamma-point only\n0\nGamma\n1 1 1\n";
+    kpoints.close();
+
+    std::cout << "📎 Expecting POTCAR in working directory\n";
+    std::cout << "⚙️  Running VASP (vasp_std > out.log)...\n";
+
+    int code = std::system("mpirun -np 16 vasp_gam > vasp.log");
+    if (code != 0) {
+        std::cerr << "❌ VASP execution failed.\n";
+        std::abort();
+    }
+
+    // 解析 OUTCAR 中的 TOTAL-FORCE
+    std::ifstream log("OUTCAR");
+    if (!log) {
+        std::cerr << "❌ Cannot open OUTCAR.\n";
+        std::abort();
+    }
+
+    const double sc = 0.0194469;
+
+    std::vector<Vec3f64> forces;
+    std::string line;
+    while (std::getline(log, line)) {
+        if (line.find("TOTAL-FORCE (eV/Angst)") != std::string::npos) {
+            std::getline(log, line); // --------
+
+            while (std::getline(log, line)) {
+                if (line.find("--------") != std::string::npos) {
+                    break;
+                }
+
+                std::istringstream iss(line);
+                double x, y, z, fx, fy, fz;
+                iss >> x >> y >> z >> fx >> fy >> fz;
+                forces.push_back(Vec3f64(fx, fy, fz) * sc);
+            }
+
+            break;
+        }
+    }
+
+    if (forces.size() != coords.size()) {
+        std::cerr << "❌ Parsed force number mismatch (" << forces.size()
+                  << " vs " << coords.size() << ").\n";
+        std::abort();
+    }
+
+    return forces;
+}
+
+
+std::vector<Vec3f64> Cell::calculate_gradient_gauss(int charge,
+                                                    int multip) const {
+    const std::string job = "gauss";
+    const std::string gjf = job + ".gjf";
+    const std::string log = job + ".log";
+
+    // 1) write .gjf input
+    {
+        std::ofstream f(gjf);
+        f << "%chk=" << job << ".chk\n"
+          << "# hf/6-31G(d) force\n\n"
+          << "Force calculation\n\n"
+          << charge << " " << multip << "\n";
+        for (size_t i = 0; i < coords.size(); ++i) {
+            f << symbols[i] << "  "
+              << coords[i].x << "  "
+              << coords[i].y << "  "
+              << coords[i].z << "\n";
+        }
+        f << "\n";
+    }
+
+    // 2) use g16
+    std::cout << "⚙️ Running Gaussian...\n";
+    if (std::system(("g16 " + gjf + " > " + log).c_str()) != 0) {
+        std::cerr << "❌ Gaussian failed.\n"; std::abort();
+    }
+
+    // 3) analys .log 中的 "Forces (Hartrees/Bohr)"
+    std::ifstream fin(log);
+    if (!fin) { std::cerr << "❌ Cannot open " << log << "\n"; std::abort(); }
+
+    std::vector<Vec3f64> grads;
+    std::string line;
+    bool in_forces = false;
+    while (std::getline(fin, line)) {
+        if (!in_forces) {
+            if (line.find("Forces (Hartrees/Bohr)") != std::string::npos) {
+                // skip header lines
+                std::getline(fin, line);
+                std::getline(fin, line);
+                in_forces = true;
+            }
+        } else {
+            if (line.find("----") != std::string::npos) break;
+            std::istringstream iss(line);
+            int idx, Z;
+            double fx, fy, fz;
+            if (iss >> idx >> Z >> fx >> fy >> fz) {
+                // gradient = –Force
+                grads.emplace_back(-fx, -fy, -fz);
+            }
+        }
+    }
+    if (grads.size() != coords.size()) {
+        std::cerr << "❌ Gaussian gradient count mismatch\n";
+        std::abort();
+    }
+    return grads;
+}
+
+double Cell::get_energy_from_gauss() const {
+    const std::string log = "gauss.log";
+    std::ifstream fin(log);
+    if (!fin) { 
+        std::cerr << "❌ Cannot open " << log << "\n"; 
+        std::abort(); 
+    }
+
+    double energy = 0.0;
+    std::string line;
+    bool found_energy = false;
+    
+    while (std::getline(fin, line)) {
+        // 查找SCF Done行，包含最终能量
+        if (line.find("SCF Done:") != std::string::npos) {
+            std::istringstream iss(line);
+            std::string token;
+            // 跳过 "SCF Done: E(RHF) ="
+            for (int i = 0; i < 4; ++i) {
+                iss >> token;
+            }
+            // 读取能量值
+            iss >> energy;
+            found_energy = true;
+            break;
+        }
+    }
+    
+    if (!found_energy) {
+        std::cerr << "❌ 未能在Gaussian输出中找到能量信息\n";
+        std::abort();
+    }
+    
+    return energy;  // 返回Hartree单位的能量
+}
+
+`cell.hpp
+// File: cell.hpp
+#pragma once
+
+#include <string>
+#include <vector>
+#include "vec3f64.hpp"
+
+class Cell {
+public:
+    std::vector<Vec3f64> lattice;       // 3x3 矩阵
+    std::vector<std::string> species;   // 元素符号顺序
+    std::vector<int> num_atoms;         // 每个元素的原子数
+    std::vector<std::string> symbols;   // 每个原子对应的元素符号
+    std::vector<Vec3f64> coords;        // 原子笛卡尔坐标
+
+    Cell();  // 默认构造函数
+    static Cell from_poscar(const std::string& filename);
+
+    std::string to_geometry() const;
+    std::string to_poscar() const;
+    std::vector<Vec3f64> calculate_gradient_from_vasp() const;
+    std::vector<Vec3f64> calculate_gradient_gauss(int charge = 0,
+                                                   int multip = 1) const;
+    
+    // 新增：从Gaussian输出中解析能量（Hartree单位）
+    double get_energy_from_gauss() const;
+};
+
+`gdiis.cpp
+#include "gdiis.hpp"
+#include <cmath>
+#include <cassert>
+#include <iostream>
+#include <cstdlib>
+
+GDIIS::GDIIS(std::size_t minS, std::size_t maxS)
+: minSpace(minS), maxSpace(maxS) {}
+
+GDIIS::~GDIIS() {}
+
+// // simple gradient descent, used when DIIS subspace < minSpace
+// Matrix GDIIS::grad_step(const Matrix& x, const Matrix& g) {
+//     const double alpha = 0.2;  // 可调
+//     return x - alpha * g;
+// }
+
+// Matrix GDIIS::newton_step(const Matrix& x, const Matrix& g) {
+//     std::size_t n = x.size();
+
+//     assert(x.rows() == n);
+//     assert(x.cols() == 1);
+//     assert(g.rows() == n);
+//     assert(g.cols() == 1);
+//     assert(n % 3 == 0);
+
+//     // 初始化对角 Hessian
+//     if (H.size() == 0) {
+//         H = Matrix(n, n);
+//         for (std::size_t i = 0; i < n; ++i) {
+//             H(i, i) = 1.0;
+//         }
+//     }
+//     else {
+//         // BFGS 对角更新：
+//         // H_i = H_i + (y_i * y_i^T) / (s_i^T * y_i) 
+//         //           - (H_i * s_i * s_i^T * H_i^T) / (s^T * H * s)
+
+//         Matrix s = x - xPrev;
+//         Matrix y = g - gPrev;
+
+//         double sty = (s.trans() % y)(0);
+//         double stHs = (s.trans() % H % s)(0);
+
+//         if (std::abs(sty) < 1e-8) {
+//             std::cerr << "sty is too small." << std::endl;
+//             std::abort();
+//         }
+
+//         if (std::abs(stHs) < 1e-8) {
+//             std::cerr << "stHs is too small." << std::endl;
+//             std::abort();
+//         }
+
+//         H  +=  (y % y.trans()) / sty - (H % s % s.trans() % H.trans()) / stHs;
+//     }
+
+//     xPrev = x;
+//     gPrev = g;
+
+//     double alpha = 0.2;
+//     Matrix p = (H.inver()) % (-g);
+//     Matrix dx = alpha * p;
+
+
+//     return x + dx;
+// }
+
+
+void GDIIS::update_diis_space(const Matrix& x, 
+                                const Matrix& e) {
+    // 1) push history
+    xHist.push_back(x);
+    eHist.push_back(e);
+
+    // 2) limit history size
+    if (xHist.size() > maxSpace) {
+        xHist.erase(xHist.begin());
+        eHist.erase(eHist.begin());
+    }
+}
+
+bool GDIIS::diis_space_ready() const {
+    assert(xHist.size() == eHist.size());
+    return xHist.size() >= minSpace;
+}
+
+
+Matrix GDIIS::extrapolate_new_vector() const {
+    assert(xHist.size() == eHist.size());
+    std::size_t n = xHist.size();
+
+    Matrix B(n+1, n+1, 0.0);
+    
+    for(std::size_t i = 0; i < n; ++i) {
+    for(std::size_t j = 0; j < n; ++j) {
+        B(i,j) = (eHist[i].trans() % eHist[j])(0);
+    }}
+
+    for (std::size_t i = 0; i < n; ++i) {
+        B(i, n) = B(n, i) = 1.0;
+    }
+
+    Matrix b(n+1, 1, 0.0);
+    b(n) = 1.0;
+
+    Matrix c = B.solve(b);
+
+    assert(c.rows() == n+1);
+    assert(c.cols() == 1);
+
+    Matrix xdiis = Matrix(xHist.front().rows(), 
+                          xHist.front().cols(), 0.0);
+    for(std::size_t i = 0; i < n; ++i) {
+        xdiis += xHist[i] * c(i);
+    }
+    
+    return xdiis;
+}
+
+`gdiis.hpp
+#pragma once
+#ifndef GDIIS_HPP
+#define GDIIS_HPP
+
+#include "matrix.hpp"
+#include <vector>
+
+/**
+ * 纯粹 DIIS + 对角 BFGS/Newton + 简单梯度下降参考
+ */
+class GDIIS {
+public:
+    GDIIS(std::size_t minSpace = 2, 
+          std::size_t maxSpace = 16);
+
+    ~GDIIS();
+
+    void update_diis_space(const Matrix& x, 
+                           const Matrix& e);
+    bool diis_space_ready() const;
+    Matrix extrapolate_new_vector() const;
+
+
+private:
+    std::size_t minSpace, maxSpace;
+
+    // 历史坐标和梯度残差
+    std::vector<Matrix> xHist;
+    std::vector<Matrix> eHist;
+
+    // //—— BFGS 近似 Hessian ——//
+    // Matrix H;
+    // Matrix xPrev, gPrev;
+
+    // //—— 私有辅助 ——//
+    // // 对角近似 Newton 步 + 信任域裁剪
+    // Matrix newton_step(const Matrix& x, const Matrix& r);
+    
+    // // simple gradient descent, used when DIIS subspace < minSpace
+    // Matrix grad_step(const Matrix& x, const Matrix& r);
+};
+
+#endif // GDIIS_HPP
+
+`geomopt.cpp
+
+#include "geomopt.hpp"
+#include <cassert>
+#include <iostream>
+
+const double alpha = 0.3;
+
+Matrix GeomOpt::get_next_coord(const Matrix& x, 
+                               const Matrix& g) {
+    std::size_t N = x.size();
+    assert(N % 3 == 0);
+
+    assert(x.rows() == N);
+    assert(x.cols() == 1);
+    assert(g.rows() == N);
+    assert(g.cols() == 1);
+
+    if (H0.size() == 0) {
+        // 初始化阶段：设置初始Hessian矩阵为单位矩阵
+        H0 = Matrix(N, N);
+        for (std::size_t i = 0; i < N; ++i) {
+            H0(i, i) = 1.0;
+        }
+
+        x0 = x;
+        g0 = g;
+
+        // 纯BFGS：直接计算新坐标
+        Matrix xnew = x0 - alpha * H0.inver() % g0;
+        return xnew;
+    }
+
+    // BFGS迭代更新阶段
+    x1 = x;
+    g1 = g;
+
+    Matrix s = x1 - x0;
+    Matrix y = g1 - g0;
+
+    double sty = (s.trans() % y)(0);
+    double stHs = (s.trans() % H0 % s)(0);
+
+    if (std::abs(sty) < 1e-8) {
+        std::cerr << "❌ BFGS数值问题：sty = " << sty << " 太小，可能导致数值不稳定" << std::endl;
+        std::cerr << "   建议检查梯度计算或调整初始结构" << std::endl;
+        std::abort();
+    }
+
+    if (std::abs(stHs) < 1e-8) {
+        std::cerr << "❌ BFGS数值问题：stHs = " << stHs << " 太小，可能导致数值不稳定" << std::endl;
+        std::cerr << "   建议检查Hessian矩阵或调整初始结构" << std::endl;
+        std::abort();
+    }
+
+    // BFGS公式更新Hessian矩阵
+    H1 =  H0 + (y % y.trans()) / sty 
+             - (H0 % s % s.trans() % H0.trans()) / stHs;
+    
+    // 纯BFGS：直接计算新坐标
+    Matrix xnew = x1 - alpha * H1.inver() % g1;
+
+    // 调试输出（可选）
+    // std::cout << "  BFGS更新: sty=" << sty << " stHs=" << stHs << std::endl;
+
+    // 更新历史数据
+    x0 = x1;
+    g0 = g1;
+    H0 = H1;
+
+    return xnew;
+}
+
+`geomopt.hpp
+#pragma once
+
+#include "matrix.hpp"
+
+class GeomOpt {
+public:
+    Matrix x0, g0, H0;
+    Matrix x1, g1, H1;
+
+    GeomOpt() {};
+
+    // return new x, and update all data
+    Matrix get_next_coord(const Matrix& x, 
+                          const Matrix& g);
+};
+
+
+
+
+ `main.cpp
+// File: src/main.cpp
+
+#include "cell.hpp"
+#include "utility.hpp"
+#include "geomopt.hpp"
+
+#include <iostream>
+#include <cstdlib>
+#include <algorithm>
+#include <vector>
+#include <cstddef>
+
+bool converged(const std::vector<Vec3f64>& grads, double thresh) {
+    for (const auto& g : grads) {
+        if (g.len() > thresh) return false;
+    }
+    return true;
+}
+
+double max_gradient(const std::vector<Vec3f64>& grads) {
+    double maxG = 0.0;
+    for (const auto& g : grads) {
+        maxG = std::max(maxG, g.len());
+    }
+    return maxG;
+}
+
+double max_displacement(const std::vector<Vec3f64>& coords_old, 
+                       const std::vector<Vec3f64>& coords_new) {
+    double maxD = 0.0;
+    for (size_t i = 0; i < coords_old.size(); ++i) {
+        Vec3f64 dx = coords_new[i] - coords_old[i];
+        maxD = std::max(maxD, dx.len());
+    }
+    return maxD;
+}
+
+void print(const std::vector<Vec3f64>& v) {
+    for (const auto& vi : v) {
+        std::cout << vi.to_string() << std::endl;
+    }
+}
+
+int main(int argc, char** argv) {
+    if (argc < 2 || argc > 3) {
+        std::cerr << "Usage: opt POSCAR [vasp|gauss|both]\n";
+        return 1;
+    }
+
+    std::string method = "vasp";               // 默认用 VASP
+    if (argc == 3) method = argv[2];  
+    std::transform(method.begin(), method.end(),
+                   method.begin(), ::tolower);
+
+    Cell cell = Cell::from_poscar(argv[1]);
+    std::size_t nAtom = cell.coords.size();
+    GeomOpt  opt;
+    const int    max_iter = 200;
+    const double thresh   = 1e-6;
+    bool         is_conv  = false;
+
+    for (int iter = 1; iter <= max_iter; ++iter) {
+        std::vector<Vec3f64> grads_vasp, grads_gauss, grads;
+        
+        // 保存旧坐标用于计算位移
+        std::vector<Vec3f64> coords_old = cell.coords;
+        double energy = 0.0;
+
+        // 1) 根据 method 选择梯度来源
+        if (method == "vasp" || method == "both") {
+            grads_vasp = cell.calculate_gradient_from_vasp();
+        }
+        if (method == "gauss" || method == "both") {
+            grads_gauss = cell.calculate_gradient_gauss(/*charge=*/0, /*multip=*/1);
+            // 获取能量（仅Gaussian方法）
+            energy = cell.get_energy_from_gauss();
+        }
+
+        // 2) 如果 both，则简单打印对比，不做优化
+        if (method == "both") {
+            std::cout << "=== Iter " << iter << " ===" << std::endl;
+            std::cout << "VASP Forces:" << std::endl;
+            print(grads_vasp);
+            std::cout << "Gaussian Forces:" << std::endl;
+            print(grads_gauss);
+            std::cout << "Gaussian Energy: " << energy << " Hartree" << std::endl;
+            return 0;  // 只做一次对比就退出
+        }
+
+        // 3) 迭代优化：把选中的梯度赋给 grads
+        grads = (method == "gauss" ? grads_gauss : grads_vasp);
+
+        // 4) 打印优化信息：能量、最大受力、最大位移
+        double max_grad = max_gradient(grads);
+        
+        if (method == "gauss") {
+            std::cout << "iter = " << iter 
+                      << "  Energy = " << energy << " Hartree"
+                      << "  Max_Force = " << max_grad << " Hartree/Bohr"
+                      << std::endl;
+        } else {
+            std::cout << "iter = " << iter 
+                      << "  Energy = N/A (VASP)"
+                      << "  Max_Force = " << max_grad << " Hartree/Bohr"
+                      << std::endl;
+        }
+
+        if (converged(grads, thresh)) {
+            is_conv = true;
+            std::cout << "✅ 收敛！最大梯度: " << max_grad << " < " << thresh << std::endl;
+            break;
+        }
+
+        // 5) 构造矩阵，BFGS生成新坐标
+        Matrix xMat = vec3f64Vector_to_matrix(cell.coords)
+                          .reshape(3 * nAtom, 1);
+        Matrix gMat = vec3f64Vector_to_matrix(grads)
+                          .reshape(3 * nAtom, 1);
+        Matrix xNew = opt.get_next_coord(xMat, gMat);
+
+        // 6) 写回坐标并应用步长限制
+        const double max_step = 0.1;  // 最大步长限制（埃）
+
+        std::vector<Vec3f64> coordNew = matrix_to_vec3f64Vector(xNew.reshape(nAtom, 3));
+        for (std::size_t ic = 0; ic < nAtom; ++ic) {
+            Vec3f64 dx = coordNew[ic] - cell.coords[ic];
+            double dr = dx.len();
+
+            if (dr > max_step) {
+                dx *= (max_step / dr);
+                coordNew[ic] = cell.coords[ic] + dx;
+            }
+        }
+
+        // 计算实际发生的最大位移
+        double max_disp = max_displacement(coords_old, coordNew);
+        
+        // 更新坐标
+        cell.coords = coordNew;
+        
+        // 输出位移信息
+        std::cout << "  Max_Disp = " << max_disp << " Angstrom" << std::endl;
+    }
+
+    std::cout << (is_conv ? "✅ Converged." : "❌ Not converged.")
+              << std::endl;
+    std::cout << "Final structure:" << std::endl
+              << cell.to_geometry() << std::endl;
+
+    return 0;
+}
