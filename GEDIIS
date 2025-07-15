@@ -484,7 +484,7 @@ Matrix GEDIIS::update_and_extrapolate(const Matrix& xMat, const Matrix& gMat, do
 
     return xNew;
 }
-`GEDIIS.GPP
+`GEDIIS.HPP
 #pragma once
 #include "matrix.hpp"
 #include <vector>
