@@ -1,0 +1,741 @@
+`new rfo.cpp
+#include "rfo.hpp"
+#include <cassert>
+#include <cmath>
+#include <iostream>
+
+RFOOptimizer::RFOOptimizer(size_t dim, double trust_radius_) 
+    : H(dim, dim), trust_radius(trust_radius_), first_step(true)   //初始化Hessian矩阵为单位矩阵 设置信任域半径。 标记为第一次步进。
+{
+    for (size_t i = 0; i < dim; ++i) H(i, i) = 1.0;  //使用 for 循环将 Hessian 矩阵 H 的对角线元素初始化为 1.0，即把 Hessian 矩阵初始化为单位矩阵。
+}
+
+// void RFOOptimizer::reset_hessian() {    //重置Hessian矩阵为单位矩阵 first_step 置为 true表示这是优化过程的第一步
+//     for (size_t i = 0; i < H.rows(); ++i)   //H.rows() 和 H.cols() 分别返回矩阵 H 的行数和列数。
+//         for (size_t j = 0; j < H.cols(); ++j)
+//             H(i, j) = (i == j ? 1.0 : 0.0);  //(i == j ? 1.0 : 0.0) 是一个三元运算符，当行索引 i 等于列索引 j 时，将矩阵元素 H(i, j) 设置为 1.0；否则设置为 0.0。这样操作后，矩阵 H 就变成了单位矩阵。
+//     first_step = true;
+// }
+
+void RFOOptimizer::update_hessian(const Matrix& x, const Matrix& g) {  //接收当前点 x 和当前梯度 g 作为参数，用于更新 Hessian 矩阵。
+    if (first_step) return;   //只要不是第一步，就用BFGS公式更新Hessian。第一步不用BFGS
+    Matrix s = x - x_prev;    //计算当前点 x 与上一步点 x_prev 的差值，得到位移向量 s。
+    Matrix y = g - g_prev;    //计算当前梯度 g 与上一步梯度 g_prev 的差值，得到梯度变化向量 y。
+    double sy  = (s.trans() % y)(0);  //计算位移向量 s 的转置与梯度变化向量 y 的内积，结果存储在 sty 中。
+    double yHy = (y.trans() % H % y)(0);  //计算位移向量 s 的转置、Hessian 矩阵 H 与位移向量 s 的乘积，结果存储在 stHs 中。
+    if (std::abs(sy) < 1e-8 || std::abs(yHy) < 1e-8) return;
+    H = H - (H % y % s.trans() + s % y.trans() % H) / sy + ((sy + yHy) / (sy*sy)) * (s % s.trans()); //BFGS公式
+}
+
+Matrix RFOOptimizer::step(const Matrix& x, const Matrix& g) {     //step 方法接收当前点 x 和梯度 g 作为参数，返回一个 Matrix 类型对象，表示优化后的下一个点。
+    size_t N = x.size();  //获取当前点 x 的元素数量。
+    assert(x.rows() == N && x.cols() == 1);  //确保 x 和 g 都是列向量，即只有一列。
+    assert(g.rows() == N && g.cols() == 1);
+
+    update_hessian(x, g);
+
+    // RFO超矩阵
+    Matrix RFOmat(N+1, N+1, 0.0);    //创建一个 (N + 1) x (N + 1) 的零矩阵 RFOmat。
+    for (size_t i = 0; i < N; ++i)    //将 Hessian 矩阵 H 填充到 RFOmat 的左上角 N x N 子矩阵中。
+    for (size_t j = 0; j < N; ++j)
+        RFOmat(i, j) = H(i, j);
+
+    for (size_t i = 0; i < N; ++i) {
+        RFOmat(i, N) = g(i, 0);
+        RFOmat(N, i) = g(i, 0);
+    }
+    RFOmat(N, N) = 0.0;   //将 RFOmat 的右下角元素置为 0。 
+
+    // 特征分解
+    SelfAdjointEigenSolver ses(RFOmat); 
+    Matrix evals = ses.eigenVal();   //获取特征值矩阵 evals。
+    Matrix evecs = ses.eigenVec();    //获取特征向量矩阵 evecs。
+
+    // 选取最小λ且尾分量非零的特征向量
+    double min_lambda = std::numeric_limits<double>::infinity();   //初始化 min_lambda 为正无穷，用于存储最小特征值。
+    Matrix best_vec;
+    int M = evals.size();
+    for (int k = 0; k < M; ++k) {
+        double lambda = evals(k, 0);
+        const double tail = evecs(N, k);
+        if (std::abs(tail) > 1e-8 && lambda < min_lambda) {   //遍历所有特征值，筛选出尾分量绝对值大于 1e-8 且特征值最小的特征向量，将其赋值给 best_vec。
+            min_lambda = lambda;
+            best_vec = Matrix(M, 1);
+            for (int i = 0; i < M; ++i)
+                best_vec(i, 0) = evecs(i, k);
+        }
+    }
+    std::cout << "[RFO] x[0]=" << x(0,0) << " g[0]=" << g(0,0) << std::endl;
+    if (best_vec.size() == 0) {    //若未找到符合条件的特征向量，输出错误信息并终止程序，返回当前点 x。
+        std::cerr << "❌ RFO failed: no valid eigenvector found.\n";
+        std::abort();
+        return x;
+    }
+    std::cout << "[RFO] 选中特征值lambda=" << min_lambda << " 尾分量=" << best_vec(N,0) << std::endl;
+
+    // 计算步长方向
+    Matrix p(N, 1);   //创建一个 N x 1 的矩阵 p 用于存储步长方向。
+    double norm2 = 0.0;
+    for (size_t i = 0; i < N; ++i) {
+        p(i, 0) = best_vec(i, 0) / best_vec(N, 0);
+        norm2 += p(i, 0) * p(i, 0);
+    }
+    double step_norm = std::sqrt(norm2);   //计算步长方向向量 p，并计算其欧几里得范数 step_norm。
+    std::cout << "[RFO] 步长norm=" << step_norm << std::endl;
+
+    // Trust radius
+    if (step_norm > trust_radius) {    //若步长范数超过信任区域半径 trust_radius，则对步长方向向量 p 进行缩放，使其范数等于信任区域半径。
+        double scale = trust_radius / step_norm;
+        for (size_t i = 0; i < N; ++i)
+            p(i, 0) *= scale;
+    }
+
+    // Hessian更新
+    // update_hessian(x, g);   //调用 update_hessian 方法更新 Hessian 矩阵。
+
+    // 保存历史
+    x_prev = x;
+    g_prev = g;   //保存当前点 x 和梯度 g 作为历史记录。
+    first_step = false;   //标记当前不是第一步。
+    return x + p;   //返回当前点 x 加上步长方向向量 p，即优化后的下一个点。
+}
+
+`new rfo.hpp
+#pragma once
+#include "matrix.hpp"
+
+class RFOOptimizer {
+public:
+    RFOOptimizer(size_t dim, double trust_radius = 0.5);
+
+    // 主步生成接口
+    Matrix step(const Matrix& x, const Matrix& g);
+
+    // 可选：重置Hessian
+    void reset_hessian();
+
+private:
+    Matrix H; // Hessian
+    double trust_radius;
+    bool first_step;
+    Matrix x_prev, g_prev;
+
+    void update_hessian(const Matrix& x, const Matrix& g);
+};
+
+`new main.cpp
+// File: src/main.cpp
+
+#include "cell.hpp"
+#include "utility.hpp"
+#include "rfo.hpp"
+#include "gediis.hpp"
+#include "gdiisrfo.hpp"
+#include <iostream>
+#include <cstdlib>
+#include <algorithm>
+#include <vector>
+#include <cstddef>
+#include <cmath>
+
+
+int main(int argc, char** argv) {
+    if (argc < 2 || argc > 3) {
+        std::cerr << "Usage: opt POSCAR [vasp|gauss|both]\n";
+        return 1;
+    }
+
+    std::string method = "vasp";
+    if (argc == 3) method = argv[2];
+    std::transform(method.begin(), method.end(), method.begin(), ::tolower);
+
+    Cell cell = Cell::from_poscar(argv[1]);
+    size_t nAtom = cell.coords.size();
+    size_t dim = 3 * nAtom;
+
+    // 坐标单位从Å转为Bohr（a.u.）
+    // const double ang2bohr = 1.8897259886;  // 1 Å = 1.8897259886 Bohr
+    const double ang2bohr = 1;
+    for (auto& c : cell.coords) c *= ang2bohr;
+
+    RFOOptimizer rfo(dim, 0.5);
+    GEDIISOptimizer gediis(dim, 3, 10);
+    RFO_DIIS_Optimizer rfo_diis(dim, 4, 10, 0.5, 0.95, 10.0);
+
+    const int max_iter = 200;
+    const double grad_thresh = 1e-5; // a.u.
+    const double max_step = 0.1; // a.u.
+    bool is_conv = false;
+
+    std::vector<Vec3f64> coords_old = cell.coords;
+
+    for (int iter = 1; iter <= max_iter; ++iter) {
+        std::vector<Vec3f64> grads_vasp, grads_gauss, grads;
+        double energy = 0.0;
+
+        // 1) 梯度来源
+        if (method == "vasp" || method == "both") {
+            grads_vasp = cell.calculate_gradient_from_vasp();
+        }
+        if (method == "gauss" || method == "both") {
+            grads_gauss = cell.calculate_gradient_gauss(0, 1);
+            energy = cell.get_energy_from_gauss();
+        }
+        if (method == "both") {
+            std::cout << "=== Iter " << iter << " ===\n";
+            std::cout << "VASP Forces:\n"; print(grads_vasp);
+            std::cout << "Gaussian Forces:\n"; print(grads_gauss);
+            std::cout << "Gaussian Energy: " << energy << " Hartree\n";
+            return 0;
+        }
+        grads = (method == "gauss" ? grads_gauss : grads_vasp);
+
+        // 2) 计算RMS位移/力
+        double rms_disp = rms(coords_old, cell.coords); // a.u.
+        double rms_grad = rms(grads); // a.u.
+        double max_grad = max_gradient(grads);
+
+        // 3) 优化器自适应切换
+        Matrix xMat = vec3f64Vector_to_matrix(cell.coords).reshape(dim, 1);
+        Matrix gMat = vec3f64Vector_to_matrix(grads).reshape(dim, 1);
+        Matrix xNew;
+
+        // xNew = gediis.step(xMat, gMat, energy);
+
+        if (iter == 1) {
+            std::cout << "[main] 初始强制使用 RFO 起步" << std::endl;
+            xNew = rfo.step(xMat, gMat);
+        }
+        else if (rms_grad > 1e-2) {
+            std::cout << "[main] 使用 RFO(RMS_Disp > 1e-2)" << std::endl;
+            xNew = rfo.step(xMat, gMat);
+        }
+        
+        else {
+            std::cout << "[main] 使用 GEDIIS(中等收敛阶段)" << std::endl;
+            xNew = gediis.step(xMat, gMat, energy);
+        }
+
+        // else if (rms_disp > 2.5e-3 || rms_grad > grad_thresh || max_grad > grad_thresh) {
+        //     std::cout << "[main] 使用 GEDIIS(中等收敛阶段)" << std::endl;
+        //     xNew = gediis.step(xMat, gMat, energy);
+        // }
+        // else {
+        //     std::cout << "[main] 使用 RFO-DIIS(精细收敛阶段)" << std::endl;
+        //     xNew = rfo_diis.step(xMat, gMat, energy);
+        // }
+
+        // 4) 步长限制、结构检查
+        std::vector<Vec3f64> coordNew = matrix_to_vec3f64Vector(xNew.reshape(nAtom, 3));
+        for (size_t ic = 0; ic < nAtom; ++ic) {
+            Vec3f64 dx = coordNew[ic] - cell.coords[ic];
+            double dr = dx.len();
+            if (dr > max_step) {
+                dx *= (max_step / dr);
+                coordNew[ic] = cell.coords[ic] + dx;
+            }
+        }
+
+        // 5) 检查NaN
+        for (const auto& c : coordNew) {
+            if (std::isnan(c.x) || std::isnan(c.y) || std::isnan(c.z)) {
+                std::cerr << "❌ 优化步生成了NaN坐标终止\n";
+                std::abort();
+            }
+        }
+
+        // 6) 更新
+        coords_old = cell.coords;
+        cell.coords = coordNew;
+
+        //输出最大位移
+        double max_disp = 0.0;
+        for (size_t i = 0; i < coordNew.size(); ++i)
+            max_disp = std::max(max_disp, (coordNew[i] - coords_old[i]).len());
+        std::cout << "[main] 本步最大原子位移 = " << max_disp << " a.u." << std::endl;
+        
+        // 7) 输出
+        std::cout << "iter = " << iter
+                  << "  Energy = " << energy << " Hartree"
+                  << "  RMS_Force = " << rms_grad << " a.u."
+                  << "  Max_Force = " << max_grad << " a.u."
+                  << "  RMS_Disp = " << rms_disp << " a.u."
+                  << std::endl;
+
+        if (rms_grad < grad_thresh && max_grad < grad_thresh && rms_disp < 2.5e-3) {
+            is_conv = true;
+            std::cout << "✅ 收敛！" << std::endl;
+            break;
+        }
+    }
+
+    std::cout << (is_conv ? "✅ Converged." : "❌ Not converged.") << std::endl;
+    std::cout << "Final structure:\n" << cell.to_geometry() << std::endl;
+    return 0;
+}
+
+`new gediis.cpp
+#include "gediis.hpp"
+#include <cassert>
+#include <cmath>
+#include <iostream>
+
+GEDIISOptimizer::GEDIISOptimizer(size_t dim, size_t minS, size_t maxS) //dim 表示优化问题的维度，通常用于确定 Hessian 矩阵的大小。
+    : minSpace(minS), maxSpace(maxS), H(dim, dim), first_step(true)
+{
+    for (size_t i = 0; i < dim; ++i) H(i, i) = 1.0;   //构造函数体使用 for 循环将 Hessian 矩阵 H 的对角线元素设置为 1.0，即把 Hessian 矩阵初始化为单位矩阵。单位矩阵作为 Hessian 矩阵的初始值
+}
+
+void GEDIISOptimizer::reset() {
+    xHist.clear(); gHist.clear(); EHist.clear();   //xHist、gHist 和 EHist 分别是存储历史点、历史梯度和历史能量的容器
+    for (size_t i = 0; i < H.rows(); ++i)
+        for (size_t j = 0; j < H.cols(); ++j)
+            H(i, j) = (i == j ? 1.0 : 0.0);
+    first_step = true;
+}
+
+void GEDIISOptimizer::update_hessian(const Matrix& x, const Matrix& g) {
+    if (first_step) return;
+    Matrix s = x - x_prev;
+    Matrix y = g - g_prev;
+    double sy = (s.trans() % y)(0);
+    double yHy = (s.trans() % H % s)(0);
+    if (std::abs(sy) < 1e-8 || std::abs(yHy) < 1e-8) {
+        std::cerr << "sy or yHy is too small." << std::endl;
+        return;
+    } 
+    H = H - (H % y % s.trans() + s % y.trans() % H) / sy + ((sy + yHy) / (sy*sy)) * (s % s.trans());   //BFGS更新Hessian
+}
+
+void GEDIISOptimizer::update_history(const Matrix& x, const Matrix& g, double E) {   // 存储当前结构、梯度、能量 维护一个滑动窗口：最多 maxSpace 个历史结构,超过就从前面弹出
+    xHist.push_back(x);
+    gHist.push_back(g);
+    EHist.push_back(E);
+    eHist.push_back(H.inver() % g);
+    
+
+    if (xHist.size() > maxSpace) {
+        xHist.erase(xHist.begin());
+        gHist.erase(gHist.begin());
+        EHist.erase(EHist.begin());
+    }
+}
+
+Matrix GEDIISOptimizer::extrapolate_new_vector() const {     // 尝试 GEDIIS 外推一步   bool gdiis
+    size_t n = xHist.size();
+    // if (n < minSpace) return xHist.back();
+
+    // size_t ref = n - 1;
+    Matrix B(n+1, n+1, 0.0);
+
+    //GEDIIS 的误差平方矩阵
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < n; ++j) {                            
+            Matrix dr = xHist[i] - xHist[j];
+            Matrix dg = gHist[i] - gHist[j];
+            Matrix a = (dr.trans() % dg);
+            assert(a.size() == 1);
+            B(i, j) = a(0);
+        }
+    }
+
+    for (std::size_t i = 0; i < n; ++i) {
+        B(i, n) = B(n, i) = 1.0;
+    }
+
+    Matrix b(n+1, 1, 0.0);
+
+    for (std::size_t i = 0; i < n; ++i) {
+        b(i) = EHist[i];
+    }
+
+    b(n) = 1.0;
+
+    Matrix c = B.solve(b);  //调用 Matrix 类的 solve 方法，求解线性方程组 Bc = b，其中 B 是系数矩阵，b 是右侧常数向量，c 是待求解的权重向量。解出 GEDIIS 的系数 ck 满足 ∑ck = 1
+
+    // //多重robust判据
+    // // 检查c是否有NaN，排除数值不稳定的权重   当线性方程组 B * c = b 求解不稳定（如 B 奇异或病态）时，c 中可能会出现 NaN。
+    // for (size_t i = 0; i < c.rows(); ++i)
+    //     if (std::isnan(c(i,0))) {
+    //         std::cerr << "❌ GEDIIS权重系数c中有NaN,回退最新结构！" << std::endl;
+    //         return xHist.back();
+    //     }
+
+    // // 检查负权过多,添加权重负系数控制，防止过度外推；太多负系数（尤其是远离当前点的负方向），则外推幅度大且容易越界；
+    // int neg_cnt = 0;
+    // for (size_t i = 0; i < n; ++i)
+    //     if (c(i, 0) < -0.05) ++neg_cnt;
+    // if (neg_cnt > n / 2) {                //当负权重超过一半（> n/2），判定为不可信的极端外推，立即回退。
+    //     std::cerr << "⚠️ GEDIIS 权重负值过多(" << neg_cnt << "/" << n << ")，回退最新结构！" << std::endl;
+    //     return xHist.back();
+    // }
+
+    // // 输出权重向量
+    // std::cout << "[GEDIIS] 权重 c = [ ";
+    // for (size_t i = 0; i < n; ++i)
+    //     std::cout << c(i,0) << " ";
+    // std::cout << "]" << std::endl;
+
+    // // 误差平方和判据
+    // double err_sum = 0.0;
+    // for (size_t i = 0; i < n; ++i) {
+    //     Matrix dk = xHist[i] - xHist[ref];
+    //     err_sum += c(i, 0) * c(i, 0) * (dk.trans() % dk)(0);   //∑ c_k² ‖R_k - R_ref‖² 是一种度量 GEDIIS 外推结构偏离当前结构的“平均步长平方”；
+    // }
+    // std::cout << "[GEDIIS] 权重误差平方和 = " << err_sum << std::endl;
+    // if (err_sum > 1e-2) {                 //当 err_sum > 1e-2，视为 GEDIIS 收敛域失效，回退。
+    //     std::cerr << "⚠️ GEDIIS 误差平方和过大，回退最新结构!" << std::endl;
+    //     return xHist.back();
+    // }
+
+    //生成新结构
+    Matrix xnew = Matrix(xHist[0].rows(), xHist[0].cols(), 0.0);
+    for (size_t i = 0; i < n; ++i)
+        xnew += xHist[i] * c(i);
+
+    // // 检查xnew是否有NaN
+    // for (size_t i = 0; i < xnew.rows(); ++i)
+    //     if (std::isnan(xnew(i,0))) {
+    //         std::cerr << "❌ GEDIIS外推生成了NaN,回退最新结构!" << std::endl;
+    //         return xHist.back();
+    //     }
+
+    // // 检查方向是否可信：夹角余弦判据
+    // Matrix s_ref = H.solve(-gHist[ref]);  // 拟牛顿步方向
+    // Matrix dx = xnew - xHist[ref];
+    // if (dx.norm() < 1e-5) {
+    // std::cerr << "⚠️ GEDIIS 外推未改变结构(dx太小)，回退最新结构" << std::endl;
+    // return xHist.back();
+    // }
+    // double cos_theta = (s_ref.trans() % dx)(0) / (s_ref.norm() * dx.norm());
+    // std::cout << "[GEDIIS] 步方向与拟牛顿方向夹角 cosθ = " << cos_theta << std::endl;
+
+    // if (cos_theta < 0.7) {
+    //     std::cerr << "⚠️ GEDIIS 步方向偏离准牛顿方向太大(cosθ = " << cos_theta << ")，回退！"<< std::endl;
+    //     return xHist.back();
+    // }
+
+    // const auto x = xHist.back();
+    // const auto g = gHist.back();
+
+    // size_t N = x.size();  //获取当前点 x 的元素数量。
+    // assert(x.rows() == N && x.cols() == 1);  //确保 x 和 g 都是列向量，即只有一列。
+    // assert(g.rows() == N && g.cols() == 1);
+
+    // // RFO超矩阵
+    // Matrix RFOmat(N+1, N+1, 0.0);    //创建一个 (N + 1) x (N + 1) 的零矩阵 RFOmat。
+    // for (size_t i = 0; i < N; ++i)    //将 Hessian 矩阵 H 填充到 RFOmat 的左上角 N x N 子矩阵中。
+    //     for (size_t j = 0; j < N; ++j)
+    //         RFOmat(i, j) = H(i, j);
+    // for (size_t i = 0; i < N; ++i) {
+    //     RFOmat(i, N) = g(i, 0);
+    //     RFOmat(N, i) = g(i, 0);
+    // }
+    // RFOmat(N, N) = 0.0;   //将 RFOmat 的右下角元素置为 0。 
+
+    // // 特征分解
+    // SelfAdjointEigenSolver ses(RFOmat); 
+    // Matrix evals = ses.eigenVal();   //获取特征值矩阵 evals。
+    // Matrix evecs = ses.eigenVec();    //获取特征向量矩阵 evecs。
+
+    // double lambda = evals(0);
+    // Matrix I(N,N);
+    // for (std::size_t i = 0; i < N; ++i) {
+    //     I(i,i) = lambda;
+    // }
+
+    // Matrix K = (H - lambda).inver();
+
+    // for (std::size_t i = 0; i < n; ++i) {
+    //     xnew -= c(i) * (K % gHist[i]);
+    // }
+
+    return xnew;
+}
+
+Matrix GEDIISOptimizer::step(const Matrix& x, const Matrix& g, double energy) {
+    update_hessian(x, g);
+    update_history(x, g, energy);
+    
+    std::cout << "[GEDIIS] 进入 step,当前 energy = " << energy << std::endl; 
+    std::cout << "[GEDIIS] 当前历史数: " << gHist.size() << std::endl;
+
+    x_prev = x;
+    g_prev = g;
+    first_step = false;
+
+    if (xHist.size() < minSpace) {
+        return x - 0.2 * H.inver() % g;
+    }
+
+    return extrapolate_new_vector();
+}
+
+`new gediis.hpp
+#pragma once
+#include "matrix.hpp"
+#include <vector>
+
+class GEDIISOptimizer {
+public:
+    GEDIISOptimizer(size_t dim, size_t minSpace = 4, size_t maxSpace = 10);
+
+    // 主步生成接口
+    Matrix step(const Matrix& x, const Matrix& g, double energy);
+
+    // 可选：重置历史和Hessian
+    void reset();
+
+private:
+    size_t minSpace, maxSpace;
+    Matrix H; // Hessian
+    bool first_step;
+    Matrix x_prev, g_prev;
+
+    std::vector<Matrix> xHist, gHist, eHist;
+    std::vector<double> EHist;
+
+
+    void update_hessian(const Matrix& x, const Matrix& g);
+    void update_history(const Matrix& x, const Matrix& g, double E);
+    Matrix extrapolate_new_vector() const;
+};
+
+`new gdiisrfo.cpp
+// File: src/optimizer.cpp
+
+#include "gdiisrfo.hpp"
+#include <cassert>
+#include <cmath>
+#include <iostream>
+
+RFO_DIIS_Optimizer::RFO_DIIS_Optimizer(size_t dim, size_t minS, size_t maxS, double trust_radius_, double cos_cutoff_, double step_ratio_)
+    : minSpace(minS), maxSpace(maxS), H(dim, dim), trust_radius(trust_radius_), cos_cutoff(cos_cutoff_), step_ratio(step_ratio_), first_step(true)
+{
+    for (size_t i = 0; i < dim; ++i) H(i, i) = 1.0;
+}
+
+void RFO_DIIS_Optimizer::reset() {
+    xHist.clear(); gHist.clear(); EHist.clear();
+    for (size_t i = 0; i < H.rows(); ++i)
+        for (size_t j = 0; j < H.cols(); ++j)
+            H(i, j) = (i == j ? 1.0 : 0.0);
+    first_step = true;
+}
+
+void RFO_DIIS_Optimizer::update_hessian(const Matrix& x, const Matrix& g) {
+    if (first_step) return;
+    Matrix s = x - x_prev;
+    Matrix y = g - g_prev;
+    double sty = (s.trans() % y)(0);
+    double stHs = (s.trans() % H % s)(0);
+    if (std::abs(sty) < 1e-8 || std::abs(stHs) < 1e-8) return;
+    H = H + (y % y.trans()) / sty - (H % s % s.trans() % H.trans()) / stHs;
+}
+
+void RFO_DIIS_Optimizer::update_history(const Matrix& x, const Matrix& g, double E) {
+    xHist.push_back(x);
+    gHist.push_back(g);
+    EHist.push_back(E);
+    if (xHist.size() > maxSpace) {
+        xHist.erase(xHist.begin());
+        gHist.erase(gHist.begin());
+        EHist.erase(EHist.begin());
+    }
+}
+
+Matrix RFO_DIIS_Optimizer::gediis_step(const Matrix& x, const Matrix& g, double energy) {
+    update_history(x, g, energy);
+    size_t n = xHist.size();
+    if (n < minSpace) return xHist.back();
+
+    size_t ref = n - 1;
+    Matrix B(n+1, n+1, 0.0);
+
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j < n; ++j) {
+            double e_part = (EHist[i] - EHist[ref]) * (EHist[j] - EHist[ref]);
+            Matrix gi = gHist[i] - gHist[ref];
+            Matrix gj = gHist[j] - gHist[ref];
+            double g_part = (gi.trans() % gj)(0);
+            B(i, j) = e_part + g_part;
+        }
+    }
+    for (size_t i = 0; i < n; ++i)
+        B(i, n) = B(n, i) = 1.0;
+    B(n, n) = 0.0;
+
+    Matrix b(n+1, 1, 0.0);
+    b(n) = 1.0;
+
+    Matrix c = B.solve(b);
+
+    // 检查c是否有NaN
+    for (size_t i = 0; i < c.rows(); ++i)
+        if (std::isnan(c(i,0))) {
+            std::cerr << "❌ GEDIIS权重系数c中有NaN，回退最新结构！" << std::endl;
+            return xHist.back();
+        }
+
+    Matrix xnew = Matrix(xHist[0].rows(), xHist[0].cols(), 0.0);
+    for (size_t i = 0; i < n; ++i)
+        xnew += xHist[i] * c(i);
+
+    // 检查xnew是否有NaN
+    for (size_t i = 0; i < xnew.rows(); ++i)
+        if (std::isnan(xnew(i,0))) {
+            std::cerr << "❌ GEDIIS外推生成了NaN，回退最新结构！" << std::endl;
+            return xHist.back();
+        }
+
+    return xnew;
+}
+
+Matrix RFO_DIIS_Optimizer::rfo_step(const Matrix& x, const Matrix& g) {
+    size_t N = x.size();
+    // RFO超矩阵
+    Matrix RFOmat(N+1, N+1, 0.0);
+    for (size_t i = 0; i < N; ++i)
+        for (size_t j = 0; j < N; ++j)
+            RFOmat(i, j) = H(i, j);
+    for (size_t i = 0; i < N; ++i) {
+        RFOmat(i, N) = g(i, 0);
+        RFOmat(N, i) = g(i, 0);
+    }
+    RFOmat(N, N) = 0.0;
+
+    // 特征分解
+    SelfAdjointEigenSolver ses(RFOmat);
+    Matrix evals = ses.eigenVal();
+    Matrix evecs = ses.eigenVec();
+
+    // 选取最小λ且尾分量非零的特征向量
+    double min_lambda = std::numeric_limits<double>::infinity();
+    Matrix best_vec;
+    int M = evals.size();
+    for (int k = 0; k < M; ++k) {
+        double lambda = evals(k, 0);
+        const double tail = evecs(N, k);
+        if (std::abs(tail) > 1e-8 && lambda < min_lambda) {
+            min_lambda = lambda;
+            best_vec = Matrix(M, 1);
+            for (int i = 0; i < M; ++i)
+                best_vec(i, 0) = evecs(i, k);
+        }
+    }
+    if (best_vec.size() == 0) {
+        std::cerr << "❌ RFO failed: no valid eigenvector found.\n";
+        std::abort();
+        return x;
+    }
+
+    // 步长方向
+    Matrix p(N, 1);
+    double norm2 = 0.0;
+    for (size_t i = 0; i < N; ++i) {
+        p(i, 0) = best_vec(i, 0) / best_vec(N, 0);
+        norm2 += p(i, 0) * p(i, 0);
+    }
+    double step_norm = std::sqrt(norm2);
+
+    // Trust radius
+    if (step_norm > trust_radius) {
+        double scale = trust_radius / step_norm;
+        for (size_t i = 0; i < N; ++i)
+            p(i, 0) *= scale;
+    }
+
+    return x + p;
+}
+
+Matrix RFO_DIIS_Optimizer::step(const Matrix& x, const Matrix& g, double energy) {
+    update_hessian(x, g);
+
+    // 1. 生成GEDIIS外推步
+    Matrix x_gdiis = gediis_step(x, g, energy);
+    Matrix p_gdiis = x_gdiis - x;
+
+    // 2. 生成RFO步
+    Matrix x_rfo = rfo_step(x, g);
+    Matrix p_rfo = x_rfo - x;
+
+    // 3. 判据：方向接近且步长合理
+    double dot = 0.0, norm_gdiis = 0.0, norm_rfo = 0.0;
+    for (size_t i = 0; i < p_gdiis.rows(); ++i) {
+        dot += p_gdiis(i,0) * p_rfo(i,0);
+        norm_gdiis += p_gdiis(i,0) * p_gdiis(i,0);
+        norm_rfo += p_rfo(i,0) * p_rfo(i,0);
+    }
+    norm_gdiis = std::sqrt(norm_gdiis);
+    norm_rfo = std::sqrt(norm_rfo);
+
+    double cos_theta = dot / (norm_gdiis * norm_rfo + 1e-12);
+
+    bool accept = (cos_theta >= cos_cutoff) && (norm_gdiis <= step_ratio * norm_rfo);
+
+    // 4. 保存历史
+    update_history(x, g, energy);
+    x_prev = x;
+    g_prev = g;
+    first_step = false;
+
+    if (accept) {
+        std::cout << "✔️  RFO-DIIS: Accept GEDIIS step (cosθ=" << cos_theta << ", |p_gdiis|=" << norm_gdiis << ", |p_rfo|=" << norm_rfo << ")\n";
+        return x_gdiis;
+    } else {
+        std::cout << "❌  RFO-DIIS: Reject GEDIIS step, use RFO (cosθ=" << cos_theta << ", |p_gdiis|=" << norm_gdiis << ", |p_rfo|=" << norm_rfo << ")\n";
+        return x_rfo;
+    }
+}
+
+`new gdiisrfo.hpp
+#pragma once
+#include "matrix.hpp"
+#include <vector>
+
+/**
+ * RFO-DIIS混合优化器
+ * - 维护自己的Hessian和历史结构
+ * - step(x, g, E): 返回新结构
+ *   - 先用GEDIIS历史外推生成候选步
+ *   - 再用RFO生成参考步
+ *   - 比较两步方向和步长，判据通过则接受GEDIIS步，否则退回RFO步
+ */
+class RFO_DIIS_Optimizer {
+public:
+    RFO_DIIS_Optimizer(
+        size_t dim,
+        size_t minSpace = 4,
+        size_t maxSpace = 10,
+        double trust_radius = 0.5,
+        double cos_cutoff = 0.95,
+        double step_ratio = 10.0
+    );
+
+    // 主步生成接口
+    Matrix step(const Matrix& x, const Matrix& g, double energy);
+
+    // 可选：重置历史和Hessian
+    void reset();
+
+private:
+    size_t minSpace, maxSpace;
+    Matrix H; // Hessian
+    double trust_radius;
+    double cos_cutoff;
+    double step_ratio;
+    bool first_step;
+    Matrix x_prev, g_prev;
+
+    std::vector<Matrix> xHist, gHist;
+    std::vector<double> EHist;
+
+    void update_hessian(const Matrix& x, const Matrix& g);
+    void update_history(const Matrix& x, const Matrix& g, double E);
+
+    // GEDIIS外推步
+    Matrix gediis_step(const Matrix& x, const Matrix& g, double energy);
+
+    // RFO步
+    Matrix rfo_step(const Matrix& x, const Matrix& g);
+};
